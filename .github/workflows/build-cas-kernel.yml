@@ -14,21 +14,18 @@ jobs:
       - name: theos
         run: |
           git clone --depth 1 https://github.com/theos/theos "$HOME/theos"
-          cd "$HOME/theos" && yes | bash bin/install-theos || true
+          cd "$HOME/theos" && yes | bash bin/install-theos
+          ls "$HOME/theos/toolchain/linux/iphone/bin" | head
       - name: deps-xnu
         run: |
           export THEOS="$HOME/theos"
-          xnu-deps/setup.sh || true
+          xnu-deps/setup.sh
+          ls -l xnu-deps/hostinc/hostcompat.h
       - name: xnu-source
         run: |
           xnu/apply.sh
       - name: config
         run: make defconfig
-      - name: diag
-        run: |
-          head -20 .config
-          make config || true
-          ls xnu-src/xnu-8796.121.2 | head
       - name: build
         run: |
           export PATH="$HOME/theos/toolchain/linux/iphone/bin:$PATH"
@@ -38,7 +35,7 @@ jobs:
       - name: collect
         if: always()
         run: |
-          find xnu-src -name 'mach.*' -maxdepth 6 | head -20 || true
+          find xnu-src -name 'mach.*unstripped' | head -5 || true
           mkdir -p out
           K=$(find xnu-src -name 'mach.*unstripped' | head -1) || true
           if [ -n "$K" ]; then llvm-strip-18 -S -o out/hakios-kernel "$K"; ls -lh out; fi
