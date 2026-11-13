@@ -18,12 +18,10 @@ jobs:
       - name: xnu-source
         run: |
           xnu/apply.sh
-          ls xnu-src/xnu-8796.121.2/EXTERNAL_HEADERS/mach-o | head || true
       - name: deps-xnu
         run: |
           export THEOS="$HOME/theos"
           xnu-deps/setup.sh
-          ls xnu-deps/hostinc/mach-o | head || true
       - name: config
         run: make defconfig
       - name: build
@@ -37,7 +35,10 @@ jobs:
           find xnu-src -name 'mach.*unstripped' | head -5 || true
           mkdir -p out
           K=$(find xnu-src -name 'mach.*unstripped' | head -1) || true
-          if [ -n "$K" ]; then llvm-strip-18 -S -o out/hakios-kernel "$K"; ls -lh out; fi
+          if [ -n "$K" ]; then
+            llvm-strip-18 -S -o out/hakios-kernel "$K" || cp "$K" out/hakios-kernel
+            ls -lh out
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: cas-kernel
