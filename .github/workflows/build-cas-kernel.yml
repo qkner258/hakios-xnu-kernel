@@ -15,19 +15,23 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/theos/theos "$HOME/theos"
           cd "$HOME/theos" && yes | bash bin/install-theos || true
+      - name: deps-xnu
+        run: |
+          export THEOS="$HOME/theos"
+          xnu-deps/setup.sh || true
+      - name: config
+        run: make defconfig
       - name: build
         run: |
           export PATH="$HOME/theos/toolchain/linux/iphone/bin:$PATH"
           export THEOS="$HOME/theos"
           ulimit -s unlimited
-          xnu-deps/setup.sh || true
-          make cas_defconfig || make defconfig
-          make kernel JOBS=4 || true
+          make kernel JOBS=4
       - name: collect
         run: |
+          find xnu-src -name 'mach.*unstripped'
           mkdir -p out
           K=$(find xnu-src -name 'mach.*unstripped' | head -1)
-          echo "kernel: $K"
           llvm-strip-18 -S -o out/hakios-kernel "$K"
           ls -lh out
       - uses: actions/upload-artifact@v4
