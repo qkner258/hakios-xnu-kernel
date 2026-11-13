@@ -1,0 +1,36 @@
+name: build-cas-kernel
+on:
+  workflow_dispatch:
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential clang lld llvm libssl-dev uuid-dev flex bison m4 perl python3 autoconf automake libtool pkg-config
+      - name: theos
+        run: |
+          git clone --depth 1 https://github.com/theos/theos "$HOME/theos"
+          cd "$HOME/theos" && yes | bash bin/install-theos || true
+      - name: build
+        run: |
+          export PATH="$HOME/theos/toolchain/linux/iphone/bin:$PATH"
+          export THEOS="$HOME/theos"
+          ulimit -s unlimited
+          xnu-deps/setup.sh || true
+          make cas_defconfig || make defconfig
+          make kernel JOBS=4 || true
+      - name: collect
+        run: |
+          mkdir -p out
+          K=$(find xnu-src -name 'mach.*unstripped' | head -1)
+          echo "kernel: $K"
+          llvm-strip-18 -S -o out/hakios-kernel "$K"
+          ls -lh out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cas-kernel
+          path: out/hakios-kernel
