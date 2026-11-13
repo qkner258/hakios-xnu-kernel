@@ -15,20 +15,19 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/theos/theos "$HOME/theos"
           cd "$HOME/theos" && yes | bash bin/install-theos
-          ls "$HOME/theos/toolchain/linux/iphone/bin" | head
+      - name: xnu-source
+        run: |
+          xnu/apply.sh
+          ls xnu-src/xnu-8796.121.2/EXTERNAL_HEADERS/mach-o | head || true
       - name: deps-xnu
         run: |
           export THEOS="$HOME/theos"
           xnu-deps/setup.sh
-          ls -l xnu-deps/hostinc/hostcompat.h
-      - name: xnu-source
-        run: |
-          xnu/apply.sh
+          ls xnu-deps/hostinc/mach-o | head || true
       - name: config
         run: make defconfig
       - name: build
         run: |
-          export PATH="$HOME/theos/toolchain/linux/iphone/bin:$PATH"
           export THEOS="$HOME/theos"
           ulimit -s unlimited
           make kernel JOBS=4
