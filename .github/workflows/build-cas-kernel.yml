@@ -22,22 +22,26 @@ jobs:
       - name: xnu-source
         run: |
           xnu/apply.sh
-          ls xnu-src/ | head
       - name: config
         run: make defconfig
+      - name: diag
+        run: |
+          head -20 .config
+          make config || true
+          ls xnu-src/xnu-8796.121.2 | head
       - name: build
         run: |
           export PATH="$HOME/theos/toolchain/linux/iphone/bin:$PATH"
           export THEOS="$HOME/theos"
           ulimit -s unlimited
-          make kernel JOBS=4 2>&1 | tail -80
+          make kernel JOBS=4
       - name: collect
+        if: always()
         run: |
-          find xnu-src -name 'mach.*unstripped'
+          find xnu-src -name 'mach.*' -maxdepth 6 | head -20 || true
           mkdir -p out
-          K=$(find xnu-src -name 'mach.*unstripped' | head -1)
-          llvm-strip-18 -S -o out/hakios-kernel "$K"
-          ls -lh out
+          K=$(find xnu-src -name 'mach.*unstripped' | head -1) || true
+          if [ -n "$K" ]; then llvm-strip-18 -S -o out/hakios-kernel "$K"; ls -lh out; fi
       - uses: actions/upload-artifact@v4
         with:
           name: cas-kernel
