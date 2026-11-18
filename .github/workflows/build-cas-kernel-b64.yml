@@ -1,0 +1,47 @@
+name: build-cas-kernel-dbg
+on:
+  workflow_dispatch:
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential clang lld llvm libssl-dev uuid-dev flex bison m4 perl python3 autoconf automake libtool pkg-config
+      - name: theos
+        run: |
+          git clone --depth 1 https://github.com/theos/theos "$HOME/theos"
+          cd "$HOME/theos" && yes | bash bin/install-theos
+      - name: xnu-source
+        run: xnu/apply.sh
+      - name: diagnostics
+        run: |
+          echo 'IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiJBZGQgdGhlIHR3byBkaWFnbm9zdGljcyB0aGF0IHNheSB3aG8gZW5kcyB0aGUgaW5pdC4gSWRlbXBvdGVudDsgZXhpdHMgMSBpZiBhbgphbmNob3IgaXMgbWlzc2luZyBzbyB0aGUgd29ya2Zsb3cgZmFpbHMgbG91ZGx5IGluc3RlYWQgb2YgYnVpbGRpbmcgYW4gdW5wYXRjaGVkIGtlcm5lbC4iIiIKaW1wb3J0IHN5cwoKU1JDID0gJ3hudS1zcmMveG51LTg3OTYuMTIxLjIvYnNkL2tlcm4nCgoKZGVmIHBhdGNoX3NpZygpOgogICAgcCA9IFNSQyArICcva2Vybl9zaWcuYycKICAgIHMgPSBvcGVuKHApLnJlYWQoKQogICAgaWYgJ2hrLWtpbGw6JyBpbiBzOgogICAgICAgIHJldHVybiAnYWxyZWFkeScKICAgIGFuY2hvciA9ICgncHNpZ25hbF9pbnRlcm5hbChwcm9jX3QgcCwgdGFza190IHRhc2ssIHRocmVhZF90IHRocmVhZCwgaW50IGZsYXZvciwgJwogICAgICAgICAgICAgICdpbnQgc2lnbnVtLCBvc19yZWFzb25fdCBzaWduYWxfcmVhc29uKVxue1xuJykKICAgIGlmIGFuY2hvciBub3QgaW4gczoKICAgICAgICByZXR1cm4gJ2FuY2hvciBtaXNzaW5nJwogICAgYWRkID0gKAogICAgICAgICcgICAgLyogaGs6IG9ubHkgdGhlIGluaXQsIGFuZCBvbmx5IHdoZW4gbm90aGluZyBlbHNlIHdvdWxkIHNheSBpdCAqL1xuJwogICAgICAgICcgICAgaWYgKChzaWdudW0gPT0gU0lHS0lMTCB8fCBzaWdudW0gPT0gU0lHU1RPUCkgJiYgcCAhPSBQUk9DX05VTEwgJiYgcHJvY19nZXRwaWQocCkgPT0gMSkge1xuJwogICAgICAgICcgICAgICAgIHByb2NfdCBoa21lID0gY3VycmVudF9wcm9jKCk7XG4nCiAgICAgICAgJyAgICAgICAgcHJpbnRmKCJoay1raWxsOiAlcyBwaWQgJWQgc2lnbnVtICVkIGZyb20gJXMgcGlkICVkXFxuIixcbicKICAgICAgICAnICAgICAgICAgICAgcC0+cF9jb21tLCBwcm9jX2dldHBpZChwKSwgc2lnbnVtLFxuJwogICAgICAgICcgICAgICAgICAgICBoa21lICE9IFBST0NfTlVMTCA/IGhrbWUtPnBfY29tbSA6ICI/IixcbicKICAgICAgICAnICAgICAgICAgICAgaGttZSAhPSBQUk9DX05VTEwgPyBwcm9jX2dldHBpZChoa21lKSA6IC0xKTtcbicKICAgICAgICAnICAgIH1cbicKICAgICkKICAgIG9wZW4ocCwgJ3cnKS53cml0ZShzLnJlcGxhY2UoYW5jaG9yLCBhbmNob3IgKyBhZGQsIDEpKQogICAgcmV0dXJuICdwYXRjaGVkJwoKCmRlZiBwYXRjaF9leGl0KCk6CiAgICBwID0gU1JDICsgJy9rZXJuX2V4aXQuYycKICAgIHMgPSBvcGVuKHApLnJlYWQoKQogICAgaWYgJ2hrLWluaXQ6JyBpbiBzOgogICAgICAgIHJldHVybiAnYWxyZWFkeScKICAgIGFuY2hvciA9ICdleGl0X3dpdGhfcmVhc29uKHByb2NfdCBwLCBpbnQgcnYsIGludCAqcmV0dmFsLCBib29sZWFuX3QgdGhyZWFkX2Nhbl90ZXJtaW5hdGUnCiAgICBpID0gcy5maW5kKGFuY2hvcikKICAgIGlmIGkgPCAwOgogICAgICAgIHJldHVybiAnYW5jaG9yIG1pc3NpbmcnCiAgICBiID0gcy5maW5kKCd7JywgaSkKICAgIGlmIGIgPCAwOgogICAgICAgIHJldHVybiAnYnJhY2UgbWlzc2luZycKICAgIGFkZCA9ICgnXG4gICAgaWYgKHByb2NfcGlkKHApID09IDEpIHtcbicKICAgICAgICAgICAnICAgICAgICBwcmludGYoImhrLWluaXQ6IHBpZCAxIGV4aXRpbmcsIHN0YXR1cyAlZFxcbiIsIHJ2KTtcbicKICAgICAgICAgICAnICAgIH1cbicpCiAgICBvcGVuKHAsICd3Jykud3JpdGUoc1s6YiArIDFdICsgYWRkICsgc1tiICsgMTpdKQogICAgcmV0dXJuICdwYXRjaGVkJwoKCnIxID0gcGF0Y2hfc2lnKCkKcjIgPSBwYXRjaF9leGl0KCkKcHJpbnQoJ2tlcm5fc2lnLmM6JywgcjEpCnByaW50KCdrZXJuX2V4aXQuYzonLCByMikKaWYgJ21pc3NpbmcnIGluIHIxIG9yICdtaXNzaW5nJyBpbiByMjoKICAgIHN5cy5leGl0KDEpCg==' | base64 -d > /tmp/patch-hk-diag.py
+          python3 /tmp/patch-hk-diag.py
+      - name: deps-xnu
+        run: |
+          export THEOS="$HOME/theos"
+          xnu-deps/setup.sh
+      - name: config
+        run: make defconfig
+      - name: build
+        run: |
+          export THEOS="$HOME/theos"
+          ulimit -s unlimited
+          make kernel JOBS=4
+      - name: collect
+        if: always()
+        run: |
+          mkdir -p out
+          K=$(find xnu-src -name 'mach.*unstripped' | head -1) || true
+          if [ -n "$K" ]; then
+            llvm-strip-18 -S -o out/hakios-kernel-dbg "$K" || cp "$K" out/hakios-kernel-dbg
+          fi
+          ls -l out || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cas-kernel-dbg
+          path: out/hakios-kernel-dbg
