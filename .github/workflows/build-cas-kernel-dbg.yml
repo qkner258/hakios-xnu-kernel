@@ -17,62 +17,8 @@ jobs:
           cd "$HOME/theos" && yes | bash bin/install-theos
       - name: xnu-source
         run: xnu/apply.sh
-      - name: add hk diagnostics (who kills whom)
-        run: |
-          python3 - <<'PY'
-          import sys
-          ok = True
-
-          # 1) kern_sig.c: say who sent an uncatchable signal
-          p = 'xnu-src/xnu-8796.121.2/bsd/kern/kern_sig.c'
-          s = open(p).read()
-          anchor = '''psignal_internal(proc_t p, task_t task, thread_t thread, int flavor, int signum, os_reason_t signal_reason)
-{
-'''
-          add = '''	/* hk: an uncatchable signal is the one way a process goes without a word from inside */
-	/* hk: only the init, and only when nothing else would say it; every other
-	   signal keeps this path exactly as it was */
-	if ((signum == SIGKILL || signum == SIGSTOP) && p != PROC_NULL && proc_getpid(p) == 1) {
-		proc_t hkme = current_proc();
-		printf("hk-kill: %s pid %d signum %d from %s pid %d\\n",
-		    p != PROC_NULL ? p->p_comm : "?", p != PROC_NULL ? proc_getpid(p) : -1, signum,
-		    hkme != PROC_NULL ? hkme->p_comm : "?",
-		    hkme != PROC_NULL ? proc_getpid(hkme) : -1);
-	}
-'''
-          if 'hk-kill:' in s:
-              print('kern_sig.c: already patched')
-          elif anchor in s:
-              s = s.replace(anchor, anchor + add, 1)
-              open(p, 'w').write(s)
-              print('kern_sig.c: patched')
-          else:
-              print('kern_sig.c: ANCHOR NOT FOUND'); ok = False
-
-          # 2) kern_exit.c: say when pid 1 goes
-          p = 'xnu-src/xnu-8796.121.2/bsd/kern/kern_exit.c'
-          s = open(p).read()
-          anchor = '''exit_with_reason(proc_t p, int rv, int *retval, boolean_t thread_can_terminate, boolean_t perf_notify,
-'''
-          if 'hk-init:' in s:
-              print('kern_exit.c: already patched')
-          elif anchor in s:
-              i = s.find(anchor)
-              b = s.find('{', i)
-              add = '''
-	/* hk: the init going away is the end of the user space; say it with its status */
-	if (proc_pid(p) == 1) {
-		printf("hk-init: pid 1 (the init) exiting, status %d\\n", rv);
-	}
-'''
-              s = s[:b+1] + add + s[b+1:]
-              open(p, 'w').write(s)
-              print('kern_exit.c: patched')
-          else:
-              print('kern_exit.c: ANCHOR NOT FOUND'); ok = False
-
-          sys.exit(0 if ok else 1)
-          PY
+      - name: diagnostics
+        run: python3 tools/patch-hk-diag.py
       - name: deps-xnu
         run: |
           export THEOS="$HOME/theos"
@@ -91,8 +37,8 @@ jobs:
           K=$(find xnu-src -name 'mach.*unstripped' | head -1) || true
           if [ -n "$K" ]; then
             llvm-strip-18 -S -o out/hakios-kernel-dbg "$K" || cp "$K" out/hakios-kernel-dbg
-            ls -lh out
           fi
+          ls -l out || true
       - uses: actions/upload-artifact@v4
         with:
           name: cas-kernel-dbg
