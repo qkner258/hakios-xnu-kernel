@@ -1,6 +1,4 @@
 name: build-cas-kernel-a650
-# 一次性判断：把内核从 redwood(SM7325) 切到 xiaomi-mi-10(SM8250/kona, Adreno 650) 设备层再编。
-# 不用改仓库里任何已有文件，设备层在运行时从上游仓库取（sparse checkout，只拉 ~9 MB）。
 on:
   workflow_dispatch:
 
@@ -30,7 +28,6 @@ jobs:
           done
           [ "$ok" = 1 ] || echo "::warning::theos install did not finish (SDK optional)"
 
-      # 设备层：devices/xiaomi-mi-10（overlays/xnu/files 113 个文件 + drivers/umi + sm8250.config）
       - name: device layer
         run: |
           git clone --depth 1 --filter=blob:none --sparse \
@@ -41,8 +38,6 @@ jobs:
           echo "files: $(find devices/xiaomi-mi-10 -type f | wc -l)"
           ls -l devices/xiaomi-mi-10/overlays/xnu/files/bsd/dev/hakios.adreno.c
 
-      # prepare.py：verify(sha256 清单) → xnu/apply.sh 建树 → hakios.patch → xnu-device.patch
-      #             → sched.patch → 设备 overlay → umi.config
       - name: xnu tree + device overlay
         run: |
           python3 devices/xiaomi-mi-10/prepare.py kernel
@@ -52,10 +47,27 @@ jobs:
           wc -c "$XNU_SRC/iokit/Kernel/hakios.gpu.cpp"
           grep -c CONFIG_HAKIOS_ADRENO "$XNU_SRC/config/MASTER.hakios" || true
 
+      # 诊断：上一次（44462294462）就死在这一步，日志拿不到，所以让它自己说明死在哪。
+      # 行为不变，只是 -x + 失败时把最后 120 行打出来。
       - name: deps-xnu
         run: |
           export THEOS="$HOME/theos"
-          xnu-deps/setup.sh
+          echo "--- deps 现场 ---"
+          echo "THEOS=$THEOS"
+          ls -l "$THEOS/toolchain/linux/iphone/bin/ld" || echo "NO cctools ld"
+          ls -d "$THEOS/sdks/iPhoneOS16.5.sdk/usr/include" || echo "NO iPhoneOS16.5.sdk"
+          ls "$THEOS/sdks" 2>/dev/null || true
+          which clang flex bison m4 perl python3 autoconf automake xz tar curl git || true
+          echo "XNU_SRC=$XNU_SRC"
+          ls "$XNU_SRC/makedefs/MakeInc.def" || echo "NO kernel tree at XNU_SRC"
+          set +e
+          bash -x xnu-deps/setup.sh > /tmp/deps.log 2>&1
+          rc=$?
+          echo "deps-xnu exit: $rc"
+          if [ "$rc" = 0 ]; then tail -5 /tmp/deps.log; else
+            echo "--- tail 120 ---"; tail -120 /tmp/deps.log
+          fi
+          exit $rc
 
       - name: build
         run: |
@@ -81,7 +93,7 @@ jobs:
             echo "umi_a650: $(strings -a out/hakios-kernel | grep -c _umi_a650 || true)"
             echo "a650_gmu: $(strings -a out/hakios-kernel | grep -c a650_gmu || true)"
           else
-            echo "::error::没有产出内核，看上面的构建日志"
+            echo "::error::no kernel produced; see the build log above"
           fi
 
       - uses: actions/upload-artifact@v4
