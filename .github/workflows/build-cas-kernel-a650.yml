@@ -1,0 +1,92 @@
+name: build-cas-kernel-a650
+# 一次性判断：把内核从 redwood(SM7325) 切到 xiaomi-mi-10(SM8250/kona, Adreno 650) 设备层再编。
+# 不用改仓库里任何已有文件，设备层在运行时从上游仓库取（sparse checkout，只拉 ~9 MB）。
+on:
+  workflow_dispatch:
+
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      XNU_SRC: ${{ github.workspace }}/out/xiaomi-mi-10/xnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential clang lld llvm libssl-dev uuid-dev flex bison m4 perl python3 autoconf automake libtool pkg-config
+
+      - name: theos
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/theos/theos "$HOME/theos"
+          cd "$HOME/theos"
+          ok=0
+          for i in 1 2 3; do
+            if yes | bash bin/install-theos; then ok=1; break; fi
+            sleep 30
+          done
+          [ "$ok" = 1 ] || echo "::warning::theos install did not finish (SDK optional)"
+
+      # 设备层：devices/xiaomi-mi-10（overlays/xnu/files 113 个文件 + drivers/umi + sm8250.config）
+      - name: device layer
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/xm6661885/hakios-xnu-kernel-umi-fixes /tmp/umi
+          cd /tmp/umi && git sparse-checkout set devices/xiaomi-mi-10
+          cd "$GITHUB_WORKSPACE"
+          cp -a /tmp/umi/devices/xiaomi-mi-10 devices/
+          echo "files: $(find devices/xiaomi-mi-10 -type f | wc -l)"
+          ls -l devices/xiaomi-mi-10/overlays/xnu/files/bsd/dev/hakios.adreno.c
+
+      # prepare.py：verify(sha256 清单) → xnu/apply.sh 建树 → hakios.patch → xnu-device.patch
+      #             → sched.patch → 设备 overlay → umi.config
+      - name: xnu tree + device overlay
+        run: |
+          python3 devices/xiaomi-mi-10/prepare.py kernel
+          echo "--- 树里的 GPU 三件套自检 ---"
+          wc -c "$XNU_SRC/bsd/dev/hakios.adreno.c"
+          echo "umi_a650 出现次数: $(grep -c umi_a650 "$XNU_SRC/bsd/dev/hakios.adreno.c")"
+          wc -c "$XNU_SRC/iokit/Kernel/hakios.gpu.cpp"
+          grep -c CONFIG_HAKIOS_ADRENO "$XNU_SRC/config/MASTER.hakios" || true
+
+      - name: deps-xnu
+        run: |
+          export THEOS="$HOME/theos"
+          xnu-deps/setup.sh
+
+      - name: build
+        run: |
+          export THEOS="$HOME/theos"
+          ulimit -s unlimited
+          set +e
+          ./xnu-build.sh -j4 > /tmp/build.log 2>&1
+          echo "xnu-build exit: $?"
+          tail -80 /tmp/build.log
+          KERNEL="$XNU_SRC/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837" \
+            tools/make-kernel.sh --judge /tmp/build.log
+
+      - name: collect
+        if: always()
+        run: |
+          mkdir -p out
+          K=$(find "$XNU_SRC/BUILD" -name 'mach.*unstripped' 2>/dev/null | head -1)
+          [ -n "$K" ] || K=$(find "$XNU_SRC/BUILD" -name 'mach.development.bcm2837' 2>/dev/null | head -1)
+          if [ -n "$K" ]; then
+            llvm-strip-18 -S -o out/hakios-kernel "$K" || cp "$K" out/hakios-kernel
+            ls -lh out/hakios-kernel
+            echo "--- 这个内核里有没有 A650 路径 ---"
+            echo "umi_a650: $(strings -a out/hakios-kernel | grep -c _umi_a650 || true)"
+            echo "a650_gmu: $(strings -a out/hakios-kernel | grep -c a650_gmu || true)"
+          else
+            echo "::error::没有产出内核，看上面的构建日志"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cas-kernel-a650
+          path: out/hakios-kernel
+          if-no-files-found: warn
