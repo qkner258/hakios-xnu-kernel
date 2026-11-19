@@ -47,6 +47,20 @@ jobs:
           wc -c "$XNU_SRC/iokit/Kernel/hakios.gpu.cpp"
           grep -c CONFIG_HAKIOS_ADRENO "$XNU_SRC/config/MASTER.hakios" || true
 
+      # 44502962653 那次：deps-xnu 过了，编译在 57 秒时死在 bsd/dev/hakios.umi_bluetooth.o ——
+      # umi_bluetooth.c 里 #include "umi_bt_firmware.inc"，那是 build-kernel.sh 用
+      # tools/embed-firmware.py 从 fw-bluetooth/ 生成的，a650 这条流程没接这一步。
+      # 固件不在树里时脚本会生成空数组（read() 对缺文件返回 b''），BT 不通但不影响 GPU。
+      - name: bt firmware include
+        run: |
+          python3 devices/xiaomi-mi-10/tools/embed-firmware.py \
+            --patch fw-bluetooth/htbtfw20.tlv --nvm fw-bluetooth/htnv20.bin \
+            --output "$XNU_SRC/bsd/dev/umi_bt_firmware.inc"
+          echo "--- 还有没有别的 .inc 缺 ---"
+          cd "$XNU_SRC/bsd/dev"
+          grep -oh '#include "[^"]*\.inc"' *.c *.inc 2>/dev/null | sed 's/#include "//;s/"//' | sort -u |
+            while read -r f; do [ -f "$f" ] || echo "MISSING $f"; done
+
       # 诊断：上一次（44462294462）就死在这一步，日志拿不到，所以让它自己说明死在哪。
       # 行为不变，只是 -x + 失败时把最后 120 行打出来。
       - name: deps-xnu
@@ -76,6 +90,8 @@ jobs:
           set +e
           ./xnu-build.sh -j4 > /tmp/build.log 2>&1
           echo "xnu-build exit: $?"
+          echo "--- 头几条 error（tail -80 会被 make 的 Leaving directory 淹掉）---"
+          grep -n -m20 -iE 'error:|fatal error|No such file' /tmp/build.log || true
           tail -80 /tmp/build.log
           KERNEL="$XNU_SRC/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837" \
             tools/make-kernel.sh --judge /tmp/build.log
