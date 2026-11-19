@@ -1,0 +1,50 @@
+--- a/src/init.c
++++ b/src/init.c
+@@ -199,5 +199,20 @@
+ 	check(bind_dir(in_image("/hal"), "/flash/System/Library/Audio/Plug-Ins/HAL"),
+ 	    "our audio device, not Apple's plug-ins");
++	/* The immutable Apple volume lacks the umi Metal plug-in link that the RAM
++	 * system recipe installs. A synthetic mount point plus read-only bind adds
++	 * the RAM bundle at the path Metal opens, without modifying Apple's files. */
++	if (stat(in_image("/lib/HakiosMetal.bundle"), &fw_st) == 0) {
++		check(synthetic_dir("/flash/System/Library/Extensions/HakiosMetal.bundle") &&
++		    bind_dir(in_image("/lib/HakiosMetal.bundle"), "/flash/System/Library/Extensions/HakiosMetal.bundle"),
++		    "the RAM Metal plug-in on the flash root");
++	}
++	/* umi_modem=2 (devices/xiaomi-mi-10/COMMCENTER-umi.md): Apple's Mav17 baseband files, from the resident
++	 * flashboot image (their personalized folder there, /private/preboot/<hash>/usr/local after the switch), also
++	 * at the plain /usr/local/standalone/firmware/Baseband/Mav17 (the volume has no /usr/local). A mount, not a link. */
++	if (stat("/baseband-local", &fw_st) == 0) {
++		check(synthetic_dir("/flash/usr/local") && bind_dir("/baseband-local", "/flash/usr/local"),
++		    "the baseband firmware in /usr/local/standalone");
++	}
+ 	if (stat("/fw", &fw_st) == 0) {
+ 		/* the audio DSP's firmware and the speakers' configuration, from the RAM image as in a RAM boot */
+ 		check(synthetic_dir("/flash/fw") && bind_dir("/fw", "/flash/fw"), "the firmware on /fw (adsp=1, sound=N)");
+@@ -1016,7 +1031,26 @@
+ 			}
+ 		}
+ 		grafted = graft_tree(jb, to, 1, &dirs, &entries);
++		/*
++		 * On the phone's kept /var, what dpkg did to the prefix on the boots before goes back over the fresh
++		 * graft: the prefix's usr/libexec/hakios-jb-keep (tools/mk-jb.sh), dpkg's post-invoke hook, keeps it
++		 * as one archive in /private/var/db. The prefix itself stays in memory: grafted straight onto the
++		 * HFS volume, its 6900 entries reset the phone at boot (v11).
++		 */
++		if (grafted && var_kept) {
++			char *argv[] = { "/var/jb/usr/libexec/hakios-jb-keep", "restore", NULL };
++			char *envp[] = { "PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin", NULL };
++			int status = 0;
++			pid_t pid = fork();
+ 
++			if (pid == 0) {
++				execve(argv[0], argv, envp);
++				_exit(127);
++			}
++			check(pid > 0 && wait4(pid, &status, 0, NULL) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
++			    "the prefix as dpkg left it, from /private/var/db");
++		}
++
+ 		/*
+ 		 * All of it belongs to root, as it does on a phone, but for the user's corner of it: an
+ 		 * application of the prefix runs as mobile and keeps its data there (Sileo's database).

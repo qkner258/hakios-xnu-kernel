@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- what Settings holds to turn Location Services on or off: used only by "loc_test enable" -->
+	<key>com.apple.locationd.bigswitch</key>
+	<true/>
+	<!-- ask for updates on behalf of a system location bundle (MobileWiFi's by default): a command-line
+	     program has no bundle of its own for locationd to authorize (LOCATION-umi.md) -->
+	<key>com.apple.locationd.effective_bundle</key>
+	<true/>
+</dict>
+</plist>

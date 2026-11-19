@@ -1,0 +1,19 @@
+# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
+/redwood/bin/hello_dyn started by launchd
+/redwood/bin/svc_test
+/redwood/bin/surf_test
+/bin/ps -A
+/redwood/bin/mg_test
+# location (LOCATION-umi.md): MobileGestalt's location answers, then whether locationd answers at all (in the
+# background: a locationd that hangs costs this one line "loc_test: TIMEOUT", not the rest of the scenario).
+# 300 s of updates on behalf of MobileWiFi's location bundle: long enough for a Wi-Fi scan, the server's answer
+# and the user switching Location Services or Wi-Fi on meanwhile. It prints accuracies, never coordinates.
+/redwood/bin/mg_test gps location-services magnetometer gyroscope accelerometer
+/redwood/bin/loc_test 300 &
+# the processors: how many, and -- once the system has settled -- whether they work at the same time
+/redwood/bin/cpu_test
+/redwood/bin/cpu_test 240 &
+# Sileo (and any application a package put in /var/jb/Applications) on the home screen: with the root on
+# the flash, nothing in /Applications is the prefix's, so prep.sh registers them with LaunchServices by
+# uicache (tools/mk-jb.sh), in the background, retrying for two minutes while SpringBoard starts
+/var/jb/bin/sh /var/jb/prep.sh

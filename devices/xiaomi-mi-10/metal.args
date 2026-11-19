@@ -1,0 +1,3 @@
+# Xiaomi Mi 10 panel and CPU arrangement for tools/metal-run.sh.
+# The supervisor may override bootcpu/cpus to bootcpu=7 cpus=7 for USB logs.
+bootcpu=7 cpus=8 cpufreq=1 fb_hz=120 fb_threads=6 touch_poll_us=4000

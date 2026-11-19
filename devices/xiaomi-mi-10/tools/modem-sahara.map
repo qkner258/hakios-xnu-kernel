@@ -1,0 +1,18 @@
+# Verified start-sdx55.sh map. Image bytes remain private and are not included.
+6 apps.mbn
+8 qdsp6sw.mbn
+16 mdm1m9kefs1.img
+17 mdm1m9kefs2.img
+20 mdm1m9kefs3.img
+21 sbl1.mbn
+23 aop.mbn
+25 tz.mbn
+29 acdb.mbn
+33 hyp.mbn
+34 mdmddr.img
+36 multi_image_qti.mbn
+37 multi_image.mbn
+38 xbl_cfg.elf
+40 apdp.mbn
+41 devcfg.mbn
+42 sec.elf

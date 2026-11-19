@@ -1,0 +1,22 @@
+[Defines]
+  INF_VERSION = 0x0001001B
+  BASE_NAME = UmiDisplayMmVote
+  FILE_GUID = 184fb9d9-b991-4f28-a7da-e75da150fb76
+  MODULE_TYPE = DXE_DRIVER
+  VERSION_STRING = 1.0
+  ENTRY_POINT = UmiDisplayMmVoteEntry
+[Sources]
+  UmiDisplayMmVote.c
+[Packages]
+  MdePkg/MdePkg.dec
+[LibraryClasses]
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+  MemoryAllocationLib
+  BaseMemoryLib
+  IoLib
+[Guids]
+  gEfiEndOfDxeEventGroupGuid
+  gEfiEventReadyToBootGuid
+[Depex]
+  TRUE

@@ -1,0 +1,1296 @@
+/*
+ * The radio's bus, for as long as ath11k's own (ahb.c, pcic.c) is not built: what stands between
+ * the driver's core and this phone's WCN6750. It does what ahb.c's probe does for this chip, in
+ * its order, with what the files built so far need of it -- the chip's registers through the
+ * three fixed windows, and a thread that looks at the copy engines every millisecond where the
+ * driver would have their interrupts -- and it is where the driver's calls into the parts not
+ * yet built are given something to do.
+ *
+ * UMI selects QCA6390 on PCIe, uses the serialized dynamic BAR window and
+ * its stock CE/DP MSI offsets, and restarts MHI after cold-boot calibration.
+ * Its kernel transport supplies fixed firmware memory and retains CAL across reset.
+ *
+ * Where this stage ends: qmi.c has its exchange with the firmware, core.c starts the firmware
+ * in mission mode and has ce.c and hal.c set up the copy engines' rings, htc.c connects its
+ * services over them and wmi.c has the firmware say what the radio is ("service ready") and,
+ * given the driver's configuration, that it is ready for commands ("unified ready"); mac.c
+ * registers the radio with what stands in for mac80211 (lx_80211.c) and sets the data path's
+ * rings up. What the firmware said is then put in the log. With the boot-arg wifi_scan=1 the
+ * station of lx_80211.c has the radio scan, and the driver is taken down again the way its own
+ * removal does it (ath11k_core_deinit()); with wifi_join=1 the station joins the network the
+ * kernel was given, and the driver stays up, carrying the kernel's frames, until lx_stop().
+ *
+ * The kernel's boot-arg wifi_lx says how far the radio's registers are touched: 1, not at all
+ * (every write is said and dropped, every read is 0: the driver's own exchange and nothing
+ * else); 2, for real.
+ *
+ * What the phone said, 13 October: all of that happens, 270 ms from the start of the bus to
+ * "unified ready", with the copy engines looked at once a millisecond, and the scan hears the
+ * networks around (bsd/dev/hakios.wifi.c, step_driver(), has the account).
+ */
+#define LX_QMI_AS_IT_IS				/* (this file is where the driver's requests go past) */
+#include <linux/kernel.h>
+#include <linux/device.h>
+#include <linux/io.h>
+#include <linux/of.h>
+#include <linux/of_reserved_mem.h>
+#include <linux/skbuff.h>
+
+#include "core.h"
+#include "ce.h"
+#include "debug.h"
+#include "hal.h"
+#include "hif.h"
+#include "htc.h"
+#include "pcic.h"
+#include "qmi.h"
+
+#include <lx_os.h>
+#include "lx.h"
+
+static struct {
+	unsigned how;				/* wifi_lx */
+	bool umi;
+	struct mutex window_lock;
+	bool mission;				/* the firmware has been asked for mission mode, and for no other since */
+	bool closed;				/* the driver has stopped the bus: the registers are not touched again */
+	unsigned reads, writes, said, refused;
+	u32 last, last_value;			/* the register written last, and with what ... */
+	unsigned again;				/* ... and how many writes to it in a row have not been said */
+	volatile bool looking;			/* the thread that looks at the copy engines is wanted ... */
+	volatile bool looks;			/* ... and runs */
+	volatile bool data;			/* ... and looks at the data path's rings as well */
+	unsigned same;				/* it has written a ring's pointer what it held so many times */
+
+	/* what that thread has done, for the lines that say the layer is alive (lx_base.c, lx.h) */
+	unsigned long long polls;		/* its passes */
+	unsigned long long served;		/* data path entries it took care of, added up */
+	unsigned long long complaints;		/* the driver's warnings and errors, as they were said */
+	unsigned ring_at[CE_COUNT_MAX];		/* each copy engine's receive ring: where the driver has got to ... */
+	unsigned long long ring_at_ns;		/* ... and when that was last looked at */
+
+	/*
+	 * The chip's answers, and when there are none. A read that comes back all ones is not a value:
+	 * it is the bus saying that it reached nothing -- the link down, or the chip somewhere the host
+	 * cannot see it (its own power save, its firmware resetting). umi_pcie.c reads the machine's
+	 * registers the same way, 0xffffffff being a failed access. Here it also means the registers are
+	 * left alone for a moment instead of being hammered, and the event is said once (and counted for
+	 * the five-second line), never once per access.
+	 */
+	unsigned long long last_ns;		/* when the registers were last touched */
+	unsigned long long quiet_until;		/* until this (ns): the registers are not touched at all */
+	unsigned long long dead;		/* reads that came back all ones */
+	unsigned long long held_off;		/* accesses not made because of the line above */
+	unsigned bad_windows;			/* window selects that did not read back what was written */
+	bool dead_said;				/* the one line of the first such read has been said */
+
+	/* the radio's interrupts (wifi_irq=1): what the copy engines and the data path's groups are taken care of on */
+	bool irq;
+	struct mutex service;			/* one thing at a time looks at the rings: an interrupt's or the thread */
+	int ce_vector[CE_COUNT_MAX];		/* a copy engine's vector, -1: it has none (ce.c: CE_ATTR_DIS_INTR) */
+	int group_vector[ATH11K_EXT_IRQ_GRP_NUM_MAX];
+	unsigned long long late;		/* work the thread found that no interrupt had brought */
+} bus;
+
+/*
+ * The radio's interrupt vectors, as pcic.c has them for this chip: 28 of the node's 32, ten for the
+ * copy engines from vector 0 and eighteen for the data path's groups from vector 10.
+ */
+static struct ath11k_msi_user msi_users[] = {
+	{ .name = "CE", .num_vectors = 10, .base_vector = 0 },
+	{ .name = "DP", .num_vectors = 18, .base_vector = 10 },
+};
+static void irq_say(void);
+
+static const struct ath11k_msi_config msi_config = {
+	.total_vectors = 28,
+	.total_users = 2,
+	.users = msi_users,
+	.hw_rev = ATH11K_HW_WCN6750_HW10,
+};
+
+/* ---- what the driver says ---------------------------------------------------------------------- */
+
+static void
+driver_says(const char *kind, const char *format, va_list list)
+{
+	char line[320];
+	size_t length;
+
+	vsnprintf(line, sizeof(line), format, list);
+	length = strlen(line);
+	/* (Linux ends a line for whoever has not) */
+	printf("ath11k%s: %s%s", kind, line, length != 0 && line[length - 1] == '\n' ? "" : "\n");
+}
+
+void
+ath11k_info(struct ath11k_base *ab, const char *format, ...)
+{
+	va_list list;
+
+	va_start(list, format);
+	driver_says("", format, list);
+	va_end(list);
+}
+
+/* (the driver's warnings and errors are said whatever happens to the rest) */
+/*
+ * ... but not without end: a scan that goes wrong can have the firmware's events complain once a
+ * frame, and a line each would be what fills the log -- and, worse, what waits in it. The same
+ * text (the format string, which is the driver's own and so the same pointer every time) is said
+ * at most once a second; of what comes in between, only a count, with the next one that is said.
+ */
+#define COMPLAINTS_KEPT		16
+
+static struct {
+	const char *format;			/* the driver's format string: what tells two complaints apart */
+	unsigned long long at;			/* when it was last said, in ns */
+	unsigned suppressed;			/* ... and how many like it have been held back since */
+} complaints[COMPLAINTS_KEPT];
+static unsigned complaints_rotor;		/* which one a complaint of a text not seen before takes */
+
+static void
+driver_complains(const char *kind, const char *format, va_list list)
+{
+	char line[320], said[400];
+	unsigned long long now = lx_os_nanoseconds();
+	unsigned slot = ~0u, vacant = ~0u;
+
+	for (unsigned i = 0; i < COMPLAINTS_KEPT; i++) {
+		if (complaints[i].format == format) {
+			slot = i;
+			break;
+		}
+		if (complaints[i].format == NULL && vacant == ~0u) {
+			vacant = i;
+		}
+	}
+	if (slot == ~0u) {
+		slot = vacant != ~0u ? vacant : complaints_rotor++ % COMPLAINTS_KEPT;
+		complaints[slot].format = format;
+		complaints[slot].at = 0;
+		complaints[slot].suppressed = 0;
+	}
+	if (complaints[slot].at != 0 && now - complaints[slot].at < 1000000000ull) {
+		complaints[slot].suppressed++;
+		return;
+	}
+	bus.complaints++;
+	vsnprintf(line, sizeof(line), format, list);
+	if (complaints[slot].suppressed != 0) {
+		snprintf(said, sizeof(said), "ath11k %s (+%u more since the last one): %.240s", kind,
+		    complaints[slot].suppressed, line);
+	} else {
+		snprintf(said, sizeof(said), "ath11k %s: %.240s", kind, line);
+	}
+	complaints[slot].at = now;
+	complaints[slot].suppressed = 0;
+	/* (the driver's text may or may not end its line) */
+	lx_tell("%s%s", said, said[0] != 0 && said[strlen(said) - 1] == '\n' ? "" : "\n");
+}
+
+void
+ath11k_warn(struct ath11k_base *ab, const char *format, ...)
+{
+	va_list list;
+
+	va_start(list, format);
+	driver_complains("WARNS", format, list);
+	va_end(list);
+}
+
+void
+ath11k_err(struct ath11k_base *ab, const char *format, ...)
+{
+	va_list list;
+
+	va_start(list, format);
+	driver_complains("ERROR", format, list);
+	va_end(list);
+}
+
+void
+__ath11k_dbg(struct ath11k_base *ab, enum ath11k_debug_mask mask, const char *format, ...)
+{
+	va_list list;
+
+	va_start(list, format);
+	driver_says(" (debug)", format, list);
+	va_end(list);
+}
+
+void
+ath11k_dbg_dump(struct ath11k_base *ab, enum ath11k_debug_mask mask, const char *msg, const char *prefix, const void *buf,
+    size_t len)
+{
+}
+
+/* ---- the chip's registers ---------------------------------------------------------------------- */
+
+/*
+ * The last accesses of the chip's registers, for whoever looks after a hang: when the kernel has
+ * been silent for the loader's SILENCE_SECONDS, the loader (devices/xiaomi-mi-10/loader/loader.c)
+ * reads this ring on another processor and prints it -- the entry still pending is the access
+ * that did not come back (work/v29g/INVESTIGATION-hotspot3.md, P-C). The kernel is given the
+ * pointer once, by lx_os_mmio_ring() (bsd/sys/hakios.lx.h, bsd/dev/hakios.lx.c).
+ *
+ * Written without a lock: an access takes a sequence number and owns that entry until it has
+ * come back; an entry still pending is never written over, so the access that never returned
+ * keeps its place. This costs a number and a few stores per access -- no logging, nothing that
+ * can be held by a processor that has stopped.
+ */
+static struct lx_mmio_ring mmio = {
+	.magic = LX_MMIO_MAGIC,
+	.entries = LX_MMIO_ACCESSES,
+	.size = sizeof(struct lx_mmio_access),
+	.version = LX_MMIO_VERSION,
+};
+
+/* The low three bytes of MPIDR_EL1: enough to tell this phone's processors apart. */
+static unsigned
+mmio_cpu(void)
+{
+	unsigned long long mpidr;
+
+	__asm __volatile("mrs %0, mpidr_el1" : "=r" (mpidr));
+	return ((unsigned)(mpidr & 0xffffffu));
+}
+
+/* Which of the chip's windows an offset is reached through (0: its first 512K, reached directly). */
+static unsigned
+mmio_window(u32 offset)
+{
+	if (bus.umi) {
+		return (offset < ATH11K_PCI_WINDOW_START ? 0u : (unsigned)((offset >> 19) & 0x3f));
+	}
+	if (offset < ATH11K_PCI_WINDOW_START) {
+		return (0);
+	}
+	if ((offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) < ATH11K_PCI_WINDOW_RANGE_MASK) {
+		return (1);
+	}
+	return (2);
+}
+
+/* The entry for an access, written down before the access is made; NULL when the ring is full of
+ * accesses that have not come back (mmio.lost counts those that were not written down). `access`
+ * is the number the entry (or, when there was none, the access itself) was given: the kernel
+ * marks the processor with it (lx_os_mmio_begin()) so that a hang report can put this access
+ * beside the processor that made it, and mmio_end() takes the mark back with the same number. */
+static struct lx_mmio_access *
+mmio_begin(unsigned what, u32 offset, u32 at, unsigned long long now, unsigned long long caller,
+    unsigned long long *access)
+{
+	unsigned long long seq = __atomic_add_fetch(&mmio.seq, 1, __ATOMIC_RELAXED);
+	struct lx_mmio_access *a = &mmio.access[seq % LX_MMIO_ACCESSES];
+
+	*access = seq;
+	lx_os_mmio_begin(seq, now);		/* (this processor is inside an access from here on) */
+	if (__atomic_load_n(&a->pending, __ATOMIC_ACQUIRE) != 0) {
+		/* (the access that owns this entry has not come back: that is the one to keep) */
+		__atomic_add_fetch(&mmio.lost, 1, __ATOMIC_RELAXED);
+		return (NULL);
+	}
+	a->seq = seq;
+	a->when_ns = now;
+	a->caller = caller;
+	a->value = 0;
+	a->answer = 0;
+	a->cpu = mmio_cpu();
+	a->what = what;
+	a->offset = offset;
+	a->at = at;
+	a->window = mmio_window(offset);
+	/*
+	 * The entry is in memory before the access is made: if the access never comes back, this
+	 * (and the fact that it has begun) is what the loader finds.
+	 */
+	__atomic_store_n(&a->pending, 1u, __ATOMIC_RELEASE);
+	__asm __volatile("dmb ishst" ::: "memory");
+	return (a);
+}
+
+static void
+mmio_end(struct lx_mmio_access *a, u32 value, u32 answer, unsigned long long access)
+{
+	if (a != NULL) {
+		a->value = value;
+		a->answer = answer;
+		__atomic_store_n(&a->pending, 0u, __ATOMIC_RELEASE);
+	}
+	lx_os_mmio_end(access);			/* (the mark is this access's to take back, and no other's) */
+}
+
+/*
+ * As ahb.c reaches them (ath11k_ahb_get_window_start_wcn6750()): the first 512K of the block
+ * the firmware names are the chip's first 512K; the second 512K show its data path's
+ * registers, the third its copy engines'.
+ */
+static u32
+window(struct ath11k_base *ab, u32 offset, unsigned long long now, unsigned long long caller)
+{
+	if (bus.umi) {
+		u32 select = 0x40000000u | ((offset >> 19) & 0x3f);
+
+		if (offset < ATH11K_PCI_WINDOW_START) return offset;
+		unsigned long long access;
+		struct lx_mmio_access *a = mmio_begin(LX_MMIO_WINSEL, offset, 0x310c, now, caller, &access);
+		u32 answer;
+
+		iowrite32(select, (u8 *)ab->mem + 0x310c);
+		answer = ioread32((u8 *)ab->mem + 0x310c);
+		mmio_end(a, select, answer, access);
+		if (answer != select) {			/* a select that did not take: what follows may land in another window */
+			bus.bad_windows++;
+		}
+		return ATH11K_PCI_WINDOW_START + (offset & 0x7ffff);
+	}
+	if (offset < ATH11K_PCI_WINDOW_START) {
+		return (offset);
+	}
+	if ((offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) < ATH11K_PCI_WINDOW_RANGE_MASK) {
+		return (ATH11K_PCI_WINDOW_START + (offset & ATH11K_PCI_WINDOW_RANGE_MASK));
+	}
+	if ((offset ^ HAL_SEQ_WCSS_UMAC_CE0_SRC_REG(ab)) < ATH11K_PCI_WINDOW_RANGE_MASK) {
+		return (2 * ATH11K_PCI_WINDOW_START + (offset & ATH11K_PCI_WINDOW_RANGE_MASK));
+	}
+	return (0);				/* (refused() has kept such a one out) */
+}
+
+/*
+ * The registers answer while the firmware is in mission mode and at no other time: an access
+ * outside it ends the kernel (bsd/dev/hakios.wifi.c, step 16). The driver asks for that mode
+ * before it first touches them; once it has stopped the bus, on its way to asking for the mode
+ * "off", nothing is let through any more.
+ */
+static bool
+refused(struct ath11k_base *ab, u32 offset)
+{
+	bool known = offset < ATH11K_PCI_WINDOW_START || (offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) < ATH11K_PCI_WINDOW_RANGE_MASK ||
+	    (offset ^ HAL_SEQ_WCSS_UMAC_CE0_SRC_REG(ab)) < ATH11K_PCI_WINDOW_RANGE_MASK;
+	if (bus.umi) known = !(offset & 3) && offset < 0x02000000;
+
+	if (known && bus.mission && !bus.closed) {
+		return (false);
+	}
+	if (bus.refused++ < 8) {
+		lx_tell("lx: the chip's %#x is reached for %s: NOT DONE\n", offset, !known ? "which no window shows" : bus.closed ?
+		    "after the bus was stopped" : "while the firmware is not in mission mode");
+	}
+	return (true);
+}
+
+/*
+ * The accesses are said one by one, up to a number of lines; of writes to one register in a row
+ * (a ring's pointer, moved once for every buffer) the first three, and then how many followed.
+ */
+#define SAID_FIRST	600
+
+static void
+say_repeats(void)
+{
+	if (bus.again != 0) {
+		printf("lx: ... and %u more to the chip's %#x, the last %#x\n", bus.again, bus.last, bus.last_value);
+		bus.again = 0;
+	}
+}
+
+static bool
+said_write(u32 offset, u32 value)
+{
+	static struct {
+		u32 offset, value;
+	} pointers[24];				/* while the copy engines are looked at: what each pointer was moved to last */
+	static unsigned row;
+
+	if (bus.looks) {
+		for (unsigned i = 0; i < nitems(pointers); i++) {
+			if (pointers[i].offset == offset || pointers[i].offset == 0) {
+				bool moved = pointers[i].offset == 0 || pointers[i].value != value;
+
+				pointers[i].offset = offset;
+				pointers[i].value = value;
+				bus.same += !moved;
+				return (moved && bus.said < SAID_FIRST);
+			}
+		}
+	}
+	row = offset == bus.last ? row + 1 : 0;
+	if (row >= 3) {
+		bus.again++;
+		bus.last_value = value;
+		return (false);
+	}
+	say_repeats();
+	bus.last = offset;
+	return (bus.said < SAID_FIRST);
+}
+
+/*
+ * What a read of all ones means, and the two things that are done about it: the registers are left
+ * alone for BUS_QUIET_MS, and the first such read (and the first after a quiet spell of more than a
+ * second) is said once. A read is a "first after idle" if nothing at all was touched for a second
+ * before it -- the state a scan after a long no-scan period begins in.
+ */
+#define BUS_QUIET_MS	100
+#define BUS_IDLE_NS	1000000000ull
+
+static void
+bus_answered_nothing(u32 offset, unsigned long long now, bool idle)
+{
+	bus.dead++;
+	bus.quiet_until = now + (unsigned long long)BUS_QUIET_MS * 1000000ull;
+	if (!idle && bus.dead_said) {
+		return;				/* (said already, and this is not the first after a quiet spell) */
+	}
+	bus.dead_said = true;
+	lx_tell("lx: the chip answered %#x at its %#x%s: the link or the chip is not there; the registers are left alone for %u ms "
+	    "(%llu such reads in all)\n", 0xffffffffu, offset, idle ? ", the first after a quiet spell" : "", BUS_QUIET_MS, bus.dead);
+}
+
+static u32
+bus_read32(struct ath11k_base *ab, u32 offset)
+{
+	u32 value = 0;
+	unsigned long long now;
+
+	if (refused(ab, offset)) {
+		return (0);
+	}
+	bus.reads++;
+	now = lx_os_nanoseconds();
+	if (now < bus.quiet_until) {		/* (the chip answered nothing a moment ago: it is not asked again yet) */
+		bus.held_off++;
+		return (0);
+	}
+	if (bus.how >= 2 && ab->mem != NULL) {
+		unsigned long long caller = (unsigned long long)(uintptr_t)__builtin_return_address(0);
+		unsigned long long access;
+		struct lx_mmio_access *a;
+		u32 at;
+
+		if (bus.umi) mutex_lock(&bus.window_lock);
+		at = window(ab, offset, now, caller);
+		a = mmio_begin(LX_MMIO_READ, offset, at, now, caller, &access);
+		value = ioread32((u8 *)ab->mem + at);
+		mmio_end(a, value, 0, access);
+		if (bus.umi) mutex_unlock(&bus.window_lock);
+	}
+	if (bus.how >= 2 && ab->mem != NULL && value == 0xffffffffu) {
+		bus_answered_nothing(offset, now, bus.last_ns == 0 || now - bus.last_ns > BUS_IDLE_NS);
+	}
+	bus.last_ns = now;
+	if (bus.said < SAID_FIRST) {
+		say_repeats();
+		bus.last = ~0u;
+		bus.said++;
+		printf("lx: the chip's %#x reads %#x%s\n", offset, value, bus.how >= 2 ? "" : " (NOT READ: wifi_lx=1)");
+	}
+	return (value);
+}
+
+static void
+bus_write32(struct ath11k_base *ab, u32 offset, u32 value)
+{
+	unsigned long long now = lx_os_nanoseconds();
+
+	if (refused(ab, offset)) {
+		return;
+	}
+	if (now < bus.quiet_until) {
+		/* Writes are still made (only counted): a dropped ring/doorbell write is never resent, and a
+		 * chip that wakes within the window would then lose it for good. Reads alone back off. */
+		bus.held_off++;
+	}
+	bus.writes++;
+	if (said_write(offset, value)) {
+		bus.said++;
+		printf("lx: %s the chip's %#x (at +%#x of its block): %#x\n", bus.how >= 2 ? "about to write" : "NOT WRITTEN (wifi_lx=1):",
+		    offset, bus.umi ? (offset < 0x80000 ? offset : 0x80000 + (offset & 0x7ffff)) : window(ab, offset, now,
+		    (unsigned long long)(uintptr_t)__builtin_return_address(0)), value);
+	}
+	if (bus.how >= 2 && ab->mem != NULL) {
+		unsigned long long caller = (unsigned long long)(uintptr_t)__builtin_return_address(0);
+		unsigned long long access;
+		struct lx_mmio_access *a;
+		u32 at;
+
+		if (bus.umi) mutex_lock(&bus.window_lock);
+		at = window(ab, offset, now, caller);
+		a = mmio_begin(LX_MMIO_WRITE, offset, at, now, caller, &access);
+		__asm __volatile("dsb sy");	/* (what was written to a ring is in memory before the radio is told of it) */
+		iowrite32(value, (u8 *)ab->mem + at);
+		mmio_end(a, value, 0, access);
+		if (bus.umi) mutex_unlock(&bus.window_lock);
+	}
+	bus.last_ns = now;
+}
+
+/*
+ * In place of the radio's interrupts: each copy engine is looked at as its interrupt would have
+ * ath11k do (ce.c: ath11k_ce_per_engine_service(), which takes what has been received to its
+ * owner and posts fresh buffers), and once the driver has "enabled the data path's interrupts"
+ * so is each of the groups its rings are in (dp.c: ath11k_dp_service_srng(), which is what the
+ * driver's NAPI poll calls: frames received, frames that have been sent, errors, the reorder
+ * block's answers). Once a millisecond while nothing comes; again at once while a group has
+ * used up what it was allowed in one go.
+ *
+ * With the radio's interrupts (wifi_irq=1) the rings are looked at when one arrives, on the
+ * kernel's thread for them (irq_ce(), irq_group() below), and this thread looks only every 100 ms,
+ * to count what the interrupts left behind and to take care of it.
+ */
+#define DATA_BUDGET	64
+
+static void
+bus_looks(void *argument)
+{
+	struct ath11k_base *ab = argument;
+	unsigned long long said = lx_os_nanoseconds(), sampled = said;
+	unsigned long long polls_then = 0, served_then = 0;
+	unsigned ce_count = ab->hw_params.ce_count < CE_COUNT_MAX ? ab->hw_params.ce_count : CE_COUNT_MAX;
+
+	bus.looks = true;
+	while (bus.looking) {
+		bool more = false;
+		unsigned served = 0;
+
+		if (lx_os_nanoseconds() - said > 300000000000ull) {	/* every five minutes: how the station and memory stand */
+			said = lx_os_nanoseconds();
+			lx_station_say();
+			lx_memory_say();
+			if (bus.irq) {
+				irq_say();
+			}
+		}
+		/*
+		 * Every five seconds: where the copy engines' receive rings have got to since the last
+		 * sample, and what the data path has served. A run that ends with no word leaves this as
+		 * the record of whether the firmware was still delivering anything: rings that stand still
+		 * while this line keeps coming say that the radio, and not the kernel, stopped.
+		 */
+		if (lx_os_nanoseconds() - sampled > 5000000000ull) {
+			char rings[140] = "";
+			struct lx_counts counts;
+			unsigned long long polls = bus.polls, served_all = bus.served;
+
+			sampled = lx_os_nanoseconds();
+			for (unsigned i = 0; i < ce_count; i++) {
+				struct ath11k_ce_ring *ring = ab->ce.ce_pipe[i].dest_ring;
+				unsigned at = ring != NULL ? ring->sw_index : 0;
+				unsigned moved = ring != NULL && ring->nentries_mask != 0 ?
+				    (at - bus.ring_at[i]) & ring->nentries_mask : 0;
+
+				bus.ring_at[i] = at;
+				snprintf(rings + strlen(rings), sizeof(rings) - strlen(rings), " %u", moved);
+			}
+			lx_counts_get(&counts);
+			lx_tell("lx: bus 5s: ce-rx=[%s] polls=+%llu served=+%llu scan=%d scans=%llu ended=%llu gaveup=%llu cancelled=%llu "
+			    "rx=%llu heard=%llu complaints=%llu dead=%llu held=%llu winsel=%u\n", rings, polls - polls_then,
+			    served_all - served_then, counts.scan, counts.scans, counts.scans_ended, counts.scans_given_up,
+			    counts.scans_cancelled, counts.frames, counts.heard, counts.complaints, bus.dead, bus.held_off,
+			    bus.bad_windows);
+			polls_then = polls;
+			served_then = served_all;
+		}
+
+		if (bus.irq) {
+			mutex_lock(&bus.service);
+		}
+		for (unsigned i = 0; i < ab->hw_params.ce_count; i++) {
+			ath11k_ce_per_engine_service(ab, i);
+		}
+		for (unsigned i = 0; bus.data && i < ATH11K_EXT_IRQ_GRP_NUM_MAX; i++) {
+			int done = ath11k_dp_service_srng(ab, &ab->ext_irq_grp[i], DATA_BUDGET);
+
+			more |= done >= DATA_BUDGET;
+			bus.late += bus.irq && done > 0;
+			served += done > 0 ? (unsigned)done : 0;
+		}
+		if (bus.irq) {
+			mutex_unlock(&bus.service);
+		}
+		bus.polls++;
+		bus.served += served;
+		if (!more) {
+			lx_pause_ms(bus.irq ? 100 : 1);
+		}
+	}
+	bus.looks = false;
+}
+
+/*
+ * The copy engines are looked at no more, and no register is touched from here on. This is what
+ * the driver's "interrupts off" comes to here, and it comes in time: on its way down the driver
+ * says that after its last word to the firmware over a copy engine and before it asks for the
+ * mode "off".
+ */
+static void
+bus_quiet(void)
+{
+	if (bus.irq && bus.looking) {
+		irq_say();
+	}
+	if (bus.irq) {
+		lx_os_irq_detach_all();
+	}
+	bus.data = false;
+	bus.looking = false;
+	while (bus.looks) {
+		lx_pause_ms(1);
+	}
+	say_repeats();
+}
+
+/*
+ * The bus is shut, now and for the rest of this kernel's life: refused() above lets nothing
+ * through any more, reads and writes alike, so no register of the chip is touched once its
+ * endpoint has been reset or its clock taken away. Unlike bus_stop(), which is the driver's own
+ * ordered way down, this takes no lock and does not sleep -- the caller may be a panic path, or
+ * the boot processor on its way back to the loader. Plain stores only: a processor that stops
+ * inside here holds nothing that another one needs.
+ *
+ * Why: a ring pointer written after umi_pcie_quiesce() has asserted PERST never comes back and
+ * stalls the whole SoC (work/v29i/INVESTIGATION-wifi-srng-hang.md §5.1 and §6.2, bus_shut_now()
+ * there).
+ */
+void
+lx_quiesce_registers(void)
+{
+	bus.closed = true;
+	bus.data = false;
+	bus.looking = false;
+}
+
+/* Everything the layer has done, for the once-a-second line (lx.h): nothing here locks or sleeps. */
+void
+lx_counts_get(struct lx_counts *counts)
+{
+	bzero(counts, sizeof(*counts));
+	lx_station_counts(counts);		/* (the station's part: the scans, the frames, the state) */
+	counts->polls = bus.polls;
+	counts->served = bus.served;
+	counts->complaints = bus.complaints;
+}
+
+/*
+ * A request of the driver's to the firmware, on its way out (linux/soc/qcom/qmi.h, ours). One
+ * matters here: the mode. With any mode but mission the radio's registers stop answering, and
+ * the driver does not always let go of the copy engines first -- where its start fails late,
+ * core.c asks for the mode "off" and stops the bus after that (ath11k_core_stop()). So the
+ * copy engines are let go of here, before the request leaves.
+ */
+int
+lx_qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi_txn *txn, int msg_id, size_t largest,
+    const struct qmi_elem_info *ei, const void *structure)
+{
+	if (bus.umi && msg_id == QMI_WLANFW_RESPOND_MEM_REQ_V01) {
+		struct qmi_wlanfw_respond_mem_req_msg_v01 response =
+		    *(const struct qmi_wlanfw_respond_mem_req_msg_v01 *)structure;
+		struct ath11k_qmi *wlfw = container_of(qmi, struct ath11k_qmi, handle);
+		if (response.mem_seg_len != 2) return -EINVAL;
+		for (unsigned i = 0; i < response.mem_seg_len; i++) {
+			void *memory;
+			unsigned long long address;
+			if (lx_os_radio_firmware_memory(response.mem_seg[i].type, response.mem_seg[i].size,
+			    &memory, &address)) return -EINVAL;
+			response.mem_seg[i].addr = address;
+			wlfw->target_mem[i].vaddr = memory;
+			wlfw->target_mem[i].paddr = address;
+		}
+		return qmi_send_request(qmi, sq, txn, msg_id, largest, ei, &response);
+	}
+	if (bus.umi && msg_id == QMI_WLANFW_M3_INFO_REQ_V01) {
+		struct qmi_wlanfw_m3_info_req_msg_v01 m3 =
+		    *(const struct qmi_wlanfw_m3_info_req_msg_v01 *)structure;
+		struct ath11k_qmi *wlfw = container_of(qmi, struct ath11k_qmi, handle);
+		void *memory;
+		unsigned long long address;
+		if (!wlfw->m3_mem.vaddr || lx_os_radio_firmware_memory(3, m3.size, &memory, &address)) return -EINVAL;
+		if (memory != wlfw->m3_mem.vaddr) memcpy(memory, wlfw->m3_mem.vaddr, m3.size);
+		__asm __volatile("dsb osh" ::: "memory");
+		wlfw->m3_mem.vaddr = memory;
+		wlfw->m3_mem.paddr = address;
+		m3.addr = address;
+		return qmi_send_request(qmi, sq, txn, msg_id, largest, ei, &m3);
+	}
+	if (bus.umi && msg_id == QMI_WLANFW_HOST_CAP_REQ_V01) {
+		struct qmi_wlanfw_host_cap_req_msg_v01 host =
+		    *(const struct qmi_wlanfw_host_cap_req_msg_v01 *)structure;
+		host.num_clients_valid = 1;
+		host.num_clients = 1;
+		host.nm_modem_valid = 0;
+		host.mem_cfg_mode_valid = 0;
+		host.wake_msi_valid = 1;
+		unsigned long long address;
+		unsigned data;
+		if (!lx_os_irq_msi(&address, &data)) return -ENXIO;
+		host.wake_msi = data + 13;
+		return qmi_send_request(qmi, sq, txn, msg_id, largest, ei, &host);
+	}
+	if (msg_id == QMI_WLANFW_WLAN_MODE_REQ_V01) {
+		u32 mode = ((const struct qmi_wlanfw_wlan_mode_req_msg_v01 *)structure)->mode;
+
+		if (mode != ATH11K_FIRMWARE_MODE_NORMAL && bus.looking) {
+			printf("lx: the driver asks for mode %u while the copy engines are still looked at: they are let go of first\n",
+			    mode);
+		}
+		if (mode != ATH11K_FIRMWARE_MODE_NORMAL) {
+			bus_quiet();
+		}
+		bus.mission = mode == ATH11K_FIRMWARE_MODE_NORMAL;
+		lx_tell("lx: the firmware is asked for mode %u (0: mission, 4: off, 7: calibration)\n", mode);
+	}
+	return (qmi_send_request(qmi, sq, txn, msg_id, largest, ei, structure));
+}
+
+/* ---- the radio's interrupts ---------------------------------------------------------------------- */
+
+/* A copy engine's interrupt (pcic.c: ath11k_pcic_ce_interrupt_handler() and its tasklet). */
+static void
+irq_ce(void *argument)
+{
+	struct ath11k_ce_pipe *pipe = argument;
+
+	mutex_lock(&bus.service);
+	ath11k_ce_per_engine_service(pipe->ab, pipe->pipe_num);
+	mutex_unlock(&bus.service);
+	lx_os_irq_enable(bus.ce_vector[pipe->pipe_num]);
+}
+
+/* A data path group's (pcic.c: ath11k_pcic_ext_interrupt_handler() and its NAPI poll, until it has less to do than allowed). */
+static void
+irq_group(void *argument)
+{
+	struct ath11k_ext_irq_grp *group = argument;
+	int done;
+
+	mutex_lock(&bus.service);
+	do {
+		done = bus.data ? ath11k_dp_service_srng(group->ab, group, DATA_BUDGET) : 0;
+	} while (done >= DATA_BUDGET);
+	mutex_unlock(&bus.service);
+	if (bus.data) {
+		lx_os_irq_enable(bus.group_vector[group->grp_id]);
+	}
+}
+
+/* pcic.c: ath11k_pcic_config_irq(), for this chip: which vector is whose, and the functions for them, all masked */
+static int
+irq_attach(struct ath11k_base *ab)
+{
+	unsigned index = 0;
+	int ret;
+
+	for (unsigned i = 0; i < CE_COUNT_MAX; i++) {
+		bus.ce_vector[i] = -1;
+	}
+	for (unsigned i = 0; i < ATH11K_EXT_IRQ_GRP_NUM_MAX; i++) {
+		bus.group_vector[i] = -1;
+	}
+	for (unsigned i = 0; i < ab->hw_params.ce_count; i++) {
+		if (ath11k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR) {
+			continue;
+		}
+		bus.ce_vector[i] = (int)(index++ % msi_users[0].num_vectors + msi_users[0].base_vector);
+		if ((ret = lx_os_irq_attach((unsigned)bus.ce_vector[i], irq_ce, &ab->ce.ce_pipe[i])) != 0) {
+			return (ret);
+		}
+	}
+	for (unsigned i = 0; i < ATH11K_EXT_IRQ_GRP_NUM_MAX; i++) {
+		const struct ath11k_hw_ring_mask *mask = ab->hw_params.ring_mask;
+
+		ab->ext_irq_grp[i].ab = ab;
+		ab->ext_irq_grp[i].grp_id = i;
+		if (!(mask->tx[i] || mask->rx[i] || mask->rx_err[i] || mask->rx_wbm_rel[i] || mask->reo_status[i] ||
+		    mask->rxdma2host[i] || mask->host2rxdma[i] || mask->rx_mon_status[i])) {
+			continue;
+		}
+		bus.group_vector[i] = (int)(i % msi_users[1].num_vectors + msi_users[1].base_vector);
+		if ((ret = lx_os_irq_attach((unsigned)bus.group_vector[i], irq_group, &ab->ext_irq_grp[i])) != 0) {
+			return (ret);
+		}
+	}
+	return (0);
+}
+
+/* What came, by vector: for the log. */
+static void
+irq_say(void)
+{
+	char line[400] = "";
+
+	for (unsigned v = 0; v < msi_config.total_vectors; v++) {
+		unsigned long long count = lx_os_irq_count(v);
+
+		if (count != 0) {
+			snprintf(line + strlen(line), sizeof(line) - strlen(line), " %u: %llu,", v, count);
+		}
+	}
+	lx_tell("lx: the radio's interrupts by vector (copy engines 0-9, the data path's groups 10-27):%s the thread found %llu "
+	    "times work no interrupt had brought\n", line[0] ? line : " NONE", bus.late);
+}
+
+static int
+bus_get_user_msi_vector(struct ath11k_base *ab, char *user, int *count, u32 *user_base_data, u32 *base_vector)
+{
+	/*
+	 * No vector is attached -- the phone is run with the rings looked at (bus_looks()), wifi_irq=0
+	 * -- so no MSI address is given to the rings: ce.c and dp.c take this answer as "there is
+	 * none" and set up the ring without HAL_SRNG_FLAGS_MSI_INTR, and the firmware is told an MSI
+	 * address of 0 (which is what the WCN6750 side of this port has always run with, its hif
+	 * table having no such call at all). The device does not write to the GIC's doorbell for an
+	 * interrupt that nothing serves.
+	 */
+	if (!bus.irq) {
+		return (-EINVAL);
+	}
+	for (unsigned i = 0; i < nitems(msi_users); i++) {
+		if (strcmp(user, msi_users[i].name) == 0) {
+			*count = (int)msi_users[i].num_vectors;
+			*base_vector = msi_users[i].base_vector;
+			if (bus.umi) *base_vector = i == 0 ? 3 : 14;
+			*user_base_data = *base_vector + ab->pci.msi.ep_base_data;
+			return (0);
+		}
+	}
+	return (-EINVAL);
+}
+
+static void
+bus_get_msi_address(struct ath11k_base *ab, u32 *low, u32 *high)
+{
+	*low = ab->pci.msi.addr_lo;
+	*high = ab->pci.msi.addr_hi;
+}
+
+/* pcic.c: ath11k_pcic_get_ce_msi_idx(): the copy engines with interrupts, counted */
+static void
+bus_get_ce_msi_idx(struct ath11k_base *ab, u32 ce_id, u32 *index)
+{
+	u32 n = 0;
+
+	for (u32 i = 0; i < ab->hw_params.ce_count && i != ce_id; i++) {
+		n += !(ath11k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR);
+	}
+	*index = n;
+}
+
+/* pcic.c: ath11k_pcic_start(), with the thread above where it enables the interrupts */
+static int
+bus_start(struct ath11k_base *ab)
+{
+	int ret;
+
+	set_bit(ATH11K_FLAG_DEVICE_INIT_DONE, &ab->dev_flags);
+	printf("lx: the driver starts the bus: buffers for the copy engines that receive (%u reads and %u writes of the chip's "
+	    "registers so far; the configuration the firmware was sent named %u shadow registers)\n", bus.reads, bus.writes,
+	    ab->qmi.ce_cfg.shadow_reg_v2_len);
+	ath11k_ce_rx_post_buf(ab);
+	say_repeats();
+	lx_tell("lx: the rings are set up and the copy engines have their buffers: the bus is started\n");
+	/*
+	 * (here and not when the driver is set up: the firmware is asked for calibration in between, and
+	 * the copy engines are let go of for that, interrupts and all; see lx_qmi_send_request())
+	 */
+	/*
+	 * Where the radio would raise an interrupt, said once at every start: with the radio's
+	 * interrupts (wifi_irq, never the way the phone is run) each ring is given the GIC's MSI
+	 * address; without them nothing is attached -- lx_os_irq_attach() is never called -- and
+	 * bus_get_user_msi_vector() refuses below, so ce.c's and dp.c's ring setup leaves
+	 * HAL_SRNG_FLAGS_MSI_INTR off and the radio is not told to write an MSI anywhere. The
+	 * alternative was the radio writing to the ITS's doorbell all session, for a translation
+	 * nothing has set up and an interrupt nobody serves (work/v29f/INVESTIGATION-hotspot-hang2.md
+	 * §7, item 4).
+	 */
+	lx_tell("lx: where the radio would raise an interrupt: %s\n", bus.irq ?
+	    "the GIC's MSI address is given to every ring (its vectors are attached)" :
+	    "NOWHERE -- no vector is attached, so the rings are set up with no MSI address at all (they are looked at, not raised)");
+	if (bus.irq && (ret = irq_attach(ab)) != 0) {
+		lx_tell("lx: wifi_irq: the radio's interrupts cannot be had (%d): its rings are looked at every 100 ms only\n", ret);
+		lx_os_irq_detach_all();
+	}
+	if (bus.irq) {
+		for (unsigned i = 0; i < CE_COUNT_MAX; i++) {
+			if (bus.ce_vector[i] >= 0) {
+				lx_os_irq_enable((unsigned)bus.ce_vector[i]);
+			}
+		}
+	}
+	bus.looking = true;
+	if (lx_os_thread("wifi-rings", bus_looks, ab) != 0) {
+		bus.looking = false;
+		return (-ENOMEM);
+	}
+	return (0);
+}
+
+/* pcic.c: ath11k_pcic_stop() */
+static void
+bus_stop(struct ath11k_base *ab)
+{
+	bus_quiet();
+	bus.closed = true;
+	timer_delete_sync(&ab->rx_replenish_retry);
+	ath11k_ce_cleanup_pipes(ab);
+	printf("lx: the driver stops the bus (%u reads and %u writes of the chip's registers in all, %u of the writes a ring's "
+	    "pointer written what it held)\n", bus.reads, bus.writes, bus.same);
+}
+
+/* pcic.c: ath11k_pcic_map_service_to_pipe(): which copy engines carry a service, by the chip's table */
+static int
+bus_map_service_to_pipe(struct ath11k_base *ab, u16 service, u8 *up, u8 *down)
+{
+	bool has_up = false, has_down = false;
+
+	for (u32 i = 0; i < ab->hw_params.svc_to_ce_map_len; i++) {
+		const struct service_to_pipe *entry = &ab->hw_params.svc_to_ce_map[i];
+		u32 direction = __le32_to_cpu(entry->pipedir);
+
+		if (__le32_to_cpu(entry->service_id) != service) {
+			continue;
+		}
+		if (direction == PIPEDIR_IN || direction == PIPEDIR_INOUT) {
+			*down = (u8)__le32_to_cpu(entry->pipenum);
+			has_down = true;
+		}
+		if (direction == PIPEDIR_OUT || direction == PIPEDIR_INOUT) {
+			*up = (u8)__le32_to_cpu(entry->pipenum);
+			has_up = true;
+		}
+	}
+	return (has_up && has_down ? 0 : -ENOENT);
+}
+
+static int
+bus_power_up(struct ath11k_base *ab)
+{
+	return (-lx_os_rproc_boot());
+}
+
+static void
+bus_power_down(struct ath11k_base *ab, bool is_suspend)
+{
+	if (bus.umi) lx_os_rproc_shutdown();
+}
+
+/* pcic.c: ath11k_pcic_ext_irq_enable(): the data path's rings are set up, and are looked at from here on */
+static void
+bus_irq_enable(struct ath11k_base *ab)
+{
+	for (unsigned i = 0; i < ATH11K_EXT_IRQ_GRP_NUM_MAX; i++) {
+		ab->ext_irq_grp[i].ab = ab;
+		ab->ext_irq_grp[i].grp_id = i;
+	}
+	bus.data = true;
+	for (unsigned i = 0; bus.irq && i < ATH11K_EXT_IRQ_GRP_NUM_MAX; i++) {
+		if (bus.group_vector[i] >= 0) {
+			lx_os_irq_enable((unsigned)bus.group_vector[i]);
+		}
+	}
+}
+
+static void
+bus_irq_disable(struct ath11k_base *ab)
+{
+	bus_quiet();
+}
+
+static const struct ath11k_hif_ops bus_ops = {
+	.read32 = bus_read32,
+	.write32 = bus_write32,
+	.irq_enable = bus_irq_enable,
+	.irq_disable = bus_irq_disable,
+	.start = bus_start,
+	.stop = bus_stop,
+	.map_service_to_pipe = bus_map_service_to_pipe,
+	.power_up = bus_power_up,
+	.power_down = bus_power_down,
+	/* (no interrupt vectors are offered: the rings are then set up without any, see ce.c) */
+};
+
+/* ... and with the radio's interrupts: the vectors, and where the radio writes to raise one */
+static const struct ath11k_hif_ops bus_ops_irq = {
+	.read32 = bus_read32,
+	.write32 = bus_write32,
+	.irq_enable = bus_irq_enable,
+	.irq_disable = bus_irq_disable,
+	.start = bus_start,
+	.stop = bus_stop,
+	.map_service_to_pipe = bus_map_service_to_pipe,
+	.power_up = bus_power_up,
+	.power_down = bus_power_down,
+	.get_user_msi_vector = bus_get_user_msi_vector,
+	.get_msi_address = bus_get_msi_address,
+	.get_ce_msi_idx = bus_get_ce_msi_idx,
+};
+
+/* ---- the device tree, of which there is none ------------------------------------------------------ */
+
+int
+of_property_read_string(const struct device_node *np, const char *name, const char **out)
+{
+	return (-EINVAL);
+}
+
+bool
+of_machine_is_compatible(const char *compatible)
+{
+	return (false);
+}
+
+int
+of_reserved_mem_region_to_resource(const struct device_node *np, unsigned int index, struct resource *res)
+{
+	return (-ENODEV);
+}
+
+/*
+ * The radio's own address, which the driver asks its device for before it falls back on what the
+ * firmware says (mac.c: ath11k_mac_register()); this radio's firmware says none. The kernel has
+ * it, if it was given one. Nothing here says the address.
+ */
+int
+linuxkpi_device_get_mac_address(struct device *dev, char *address)
+{
+	return (lx_os_radio_address((unsigned char *)address) ? 0 : -ENOENT);
+}
+
+/* ---- what the firmware has said of the radio ------------------------------------------------------- */
+
+/* After "unified ready": what wmi.c has kept of the firmware's two announcements. */
+static void
+say_radio(struct ath11k_base *ab)
+{
+	const struct ath11k_targ_cap *t = &ab->target_caps;
+
+	printf("lx: THE FIRMWARE SAYS OF THE RADIO: %u radio(s); %u chains (mask %#x); up to %u channels in a scan, %u MACs; "
+	    "transmit power %d..%d; phy %#x, HT %#x, VHT %#x (MCS %#x), system %#x\n", ab->num_radios, t->num_rf_chains,
+	    t->txrx_chainmask, t->max_num_scan_channels, t->max_supported_macs, (int)t->hw_min_tx_power, (int)t->hw_max_tx_power,
+	    t->phy_capability, t->ht_cap_info, t->vht_cap_info, t->vht_supp_mcs, t->sys_cap_info);
+	/* (the second number is from the same structure of "ready" as the address: it shows that was read) */
+	printf("lx: its address, by the firmware: %02x:%02x:%02x:%02x:%02x:%02x (and its check sum of the packet log's "
+	    "definitions: %#x)\n", ab->mac_addr[0], ab->mac_addr[1], ab->mac_addr[2], ab->mac_addr[3], ab->mac_addr[4],
+	    ab->mac_addr[5], ab->pktlog_defs_checksum);
+	for (unsigned i = 0; i < ab->num_radios && i < MAX_RADIOS; i++) {
+		const struct ath11k_hal_reg_capabilities_ext *r = &ab->hal_reg_cap[i];
+		const struct ath11k_pdev_cap *c = &ab->pdevs[i].cap;
+
+		printf("lx: radio %u (pdev %u, phy %u): bands%s%s (%#x); 2.4 GHz %u..%u MHz, 5 GHz and up %u..%u MHz; regulatory "
+		    "domain %#x, wireless modes %#x; chains tx %#x rx %#x; VHT %#x, A-MPDU density %u\n", i, ab->pdevs[i].pdev_id,
+		    r->phy_id, c->supported_bands & WMI_HOST_WLAN_2G_CAP ? " 2.4 GHz" : "", c->supported_bands &
+		    WMI_HOST_WLAN_5G_CAP ? " 5 GHz" : "", c->supported_bands, r->low_2ghz_chan, r->high_2ghz_chan, r->low_5ghz_chan,
+		    r->high_5ghz_chan, r->eeprom_reg_domain, r->wireless_modes, c->tx_chain_mask, c->rx_chain_mask, c->vht_cap,
+		    c->ampdu_density);
+		for (unsigned band = 0; band < NUM_NL80211_BANDS; band++) {
+			const struct ath11k_band_cap *b = &c->band[band];
+
+			if (b->max_bw_supported == 0 && b->ht_cap_info == 0 && b->he_cap_info[0] == 0) {
+				continue;
+			}
+			printf("lx: radio %u, band %u (0: 2.4 GHz, 1: 5 GHz, 3: 6 GHz): widest channel code %u, HT %#x, HE %#x %#x "
+			    "(MCS %#x), HE at 6 GHz %#x\n", i, band, b->max_bw_supported, b->ht_cap_info, b->he_cap_info[0],
+			    b->he_cap_info[1], b->he_mcs, b->he_6ghz_capa);
+		}
+	}
+}
+
+/* ---- the entries ---------------------------------------------------------------------------------- */
+
+static struct ath11k_base *volatile driver;	/* the driver, while it is up: between lx_start() and lx_stop() */
+
+int
+lx_start(void)
+{
+	static struct device device;
+	static struct device_node node;
+	struct ath11k_base *ab;
+	unsigned long long began;
+	bool up;
+	int ret;
+
+	bus.how = lx_os_option("wifi_lx");
+	bus.umi = lx_os_option("wifi_umi") != 0;
+	/*
+	 * The last accesses of the chip's registers, for a loader on another processor to read if this
+	 * kernel stops answering (struct lx_mmio_ring, bsd/sys/hakios.lx.h; lx_bus.c below writes it).
+	 */
+	lx_os_mmio_ring(&mmio, sizeof mmio);
+	if (bus.umi) mutex_init(&bus.window_lock);
+	if (lx_prepare() != 0) {
+		lx_tell("lx: no thread, or no memory the radio can be given\n");
+		return (ENOMEM);
+	}
+	/* what the driver has to say while it is being looked into; not in a session that just uses the radio */
+	if (lx_os_option("wifi_quiet")) {
+		ath11k_debug_mask = 0;
+		bus.said = SAID_FIRST;
+	} else {
+		ath11k_debug_mask = ATH11K_DBG_QMI | ATH11K_DBG_BOOT | ATH11K_DBG_AHB | ATH11K_DBG_WMI | ATH11K_DBG_REG | ATH11K_DBG_MAC;
+	}
+	/*
+	 * The driver's parameter "frame_mode": Ethernet. The firmware then puts frames into 802.11
+	 * and takes them out of it, and ciphers them: what passes between the driver and the layer
+	 * above is what goes over a cable.
+	 */
+	ath11k_frame_mode = ATH11K_HW_TXRX_ETHERNET;
+	device.of_node = &node;
+	device.kobj.name = "wifi";
+
+	/* ahb.c: ath11k_ahb_probe(), for this chip */
+	ab = ath11k_core_alloc(&device, 0, bus.umi ? ATH11K_BUS_PCI : ATH11K_BUS_AHB);
+	if (ab == NULL) {
+		return (ENOMEM);
+	}
+	ab->hif.ops = &bus_ops;
+	bus.irq = false;
+	if (lx_os_option("wifi_irq")) {
+		unsigned long long address;
+		unsigned data;
+
+		/* (pcic.c: ath11k_pcic_init_msi_config() and what ahb.c takes from the device tree for this chip) */
+		if (lx_os_irq_msi(&address, &data)) {
+			mutex_init(&bus.service);
+			ab->pci.msi.config = &msi_config;
+			ab->pci.msi.addr_lo = (u32)address;
+			ab->pci.msi.addr_hi = (u32)(address >> 32);
+			ab->pci.msi.ep_base_data = data;
+			set_bit(ATH11K_FLAG_MULTI_MSI_VECTORS, &ab->dev_flags);
+			ab->hif.ops = &bus_ops_irq;
+			bus.irq = true;
+		} else {
+			lx_tell("lx: wifi_irq: the radio cannot be shown where to raise an interrupt: the rings are looked at, as before\n");
+		}
+	}
+	if (bus.umi) {
+		unsigned long long address;
+		unsigned data;
+		if (!lx_os_irq_msi(&address, &data)) return ENXIO;
+		ab->pci.msi.addr_lo = (u32)address;
+		ab->pci.msi.addr_hi = (u32)(address >> 32);
+		ab->pci.msi.ep_base_data = data;
+		set_bit(ATH11K_FLAG_MULTI_MSI_VECTORS, &ab->dev_flags);
+		ab->hif.ops = &bus_ops_irq; /* MSI descriptors, with polling until IRQ integration. */
+		ab->mem = lx_os_map_registers(0x60300000, 0x100000);
+		ab->mem_len = 0x100000;
+		ab->mem_ce = ab->mem;
+		if (!ab->mem) return ENOMEM;
+	}
+	ab->hw_rev = bus.umi ? ATH11K_HW_QCA6390_HW20 : ATH11K_HW_WCN6750_HW10;
+	ab->fw_mode = ATH11K_FIRMWARE_MODE_NORMAL;
+	ret = ath11k_core_pre_init(ab);
+	if (!ret && bus.umi) {
+		ab->hw_params.supports_regdb = true;
+		ab->hw_params.coldboot_cal_mm = true;
+		ab->hw_params.cbcal_restart_fw = true;
+		/*
+		 * IMPS: whether the firmware may take the radio into its own power save when it is idle.
+		 * mac.c (ath11k_mac_start()) asks the firmware for exactly that when
+		 * ab->hw_params.idle_ps is set, and the QCA6390's hw_params set it (core.c: .idle_ps =
+		 * true). Nothing in this port can then wake the chip the way Linux does: the bus below
+		 * is not ath11k's own, so ath11k_pcic_read32()'s ops->wakeup (mhi_device_get_sync) is
+		 * not in the path; LinuxKPI's mhi_device_get_sync() is a stub that answers -1; and
+		 * there is no M2, ASPM or L1 handling anywhere (work/v29f/INVESTIGATION-hotspot-hang2.md
+		 * §2.1-2.3). A scan after a long idle period has ended this kernel with no readable line
+		 * (H1a) -- so the default here is that the firmware may not enter IMPS.
+		 *
+		 * /private/var/db/umi-wifi-imps-on puts the old behaviour back, for the experiment that
+		 * tells H1a apart: it is read once, here, through lx_os_option("wifi_imps")
+		 * (hakios.lx.c), which says what it found.
+		 */
+		ab->hw_params.idle_ps = lx_os_option("wifi_imps") != 0;
+		lx_tell("lx: the firmware %s take the radio into IMPS while it is idle (idle_ps=%d: mac_start() %s ask the firmware for "
+		    "it)\n", ab->hw_params.idle_ps ? "MAY" : "may NOT", ab->hw_params.idle_ps ? 1 : 0,
+		    ab->hw_params.idle_ps ? "will" : "will not");
+	}
+	if (ret || (ret = ath11k_hal_srng_init(ab)) != 0 || (ret = ath11k_ce_alloc_pipes(ab)) != 0) {
+		lx_tell("lx: the driver does not get as far as its exchange with the firmware: %d\n", ret);
+		return (-ret);
+	}
+	ab->qmi.ce_cfg.tgt_ce_len = ab->hw_params.target_ce_count;
+	ab->qmi.ce_cfg.tgt_ce = ab->hw_params.target_ce_config;
+	ab->qmi.ce_cfg.svc_to_ce_map_len = ab->hw_params.svc_to_ce_map_len;
+	ab->qmi.ce_cfg.svc_to_ce_map = ab->hw_params.svc_to_ce_map;
+	ab->qmi.service_ins_id = ab->hw_params.qmi_service_ins_id;
+	printf("lx: the driver (\"%s\") is set up; its exchange with the firmware begins (registers: %s)\n", ab->hw_params.name,
+	    bus.how >= 2 ? "for real" : "NOT TOUCHED, wifi_lx=1");
+	if ((ret = ath11k_core_init(ab)) != 0) {
+		lx_tell("lx: the driver's start fails: %d\n", ret);
+		return (-ret);
+	}
+	if (bus.umi && (ret = ath11k_qmi_fwreset_from_cold_boot(ab)) != 0) {
+		ath11k_qmi_deinit_service(ab);
+		return -ret;
+	}
+
+	/*
+	 * The rest happens on the driver's own threads, until core.c has been through its start (it
+	 * says so with the flag below, whether that went well or not) or the exchange has failed.
+	 * It went well if the bus is still up: core.c stops it where it gives up.
+	 */
+	began = lx_os_nanoseconds();
+	while (!test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) && !test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags) &&
+	    lx_os_nanoseconds() - began < 60000000000ull) {
+		lx_pause_ms(10);
+	}
+	up = test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) && bus.looks;
+	lx_tell("lx: %llu ms after its start the driver %s; its flags: %#lx\n", (lx_os_nanoseconds() - began) / 1000000ull,
+	    up ? "IS UP as far as it is built: the firmware has said \"unified ready\"" : test_bit(ATH11K_FLAG_REGISTERED,
+	    &ab->dev_flags) ? "HAS GIVEN UP on the way and wound itself down" : "HAS NOT GOT THROUGH its exchange with the firmware",
+	    ab->dev_flags);
+	if (!up) {
+		lx_pause_ms(600);		/* (for core.c to have wound down: the mode "off") */
+		ath11k_qmi_deinit_service(ab);
+		return (test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) ? ETIMEDOUT : EIO);
+	}
+	lx_pause_ms(1000);			/* (for what the firmware says unasked once it is ready) */
+	say_radio(ab);
+
+	driver = ab;
+	if (lx_os_option("wifi_station")) {
+		/* whoever wants a network asks the kernel, and the kernel asks the station: the driver stays up until lx_stop() */
+		if ((ret = lx_station_offer()) == 0) {
+			return (0);
+		}
+	} else if (lx_os_option("wifi_join")) {
+		if ((ret = lx_station_join()) == 0) {
+			if (lx_os_option("wifi_hold")) {	/* (seconds to stay before returning: to see frames pass) */
+				lx_pause_ms(1000 * lx_os_option("wifi_hold"));
+				lx_station_say();
+			}
+			return (0);			/* the network is joined, and the driver stays up until lx_stop() */
+		}
+	} else {
+		ret = lx_os_option("wifi_scan") ? lx_station_scan() : 0;
+	}
+	lx_stop();
+	return (ret);
+}
+
+/* The thread that counts the ticks, and the memory the radio is shown: once. 0, or an errno. */
+int
+lx_prepare(void)
+{
+	return (lx_base_init() != 0 || lx_pool_init() != 0 ? ENOMEM : 0);
+}
+
+/* The network left, and the driver down as its own removal does it (the copy engines are let go of on the way: bus_quiet()). */
+void
+lx_stop(void)
+{
+	struct ath11k_base *ab = driver;
+
+	if (ab == NULL) {
+		return;
+	}
+	driver = NULL;
+	lx_station_withdraw();
+	lx_station_leave();
+	ath11k_core_deinit(ab);
+	lx_tell("lx: the driver is down again\n");
+}
+
+int
+lx_transmit(const unsigned char *frame, unsigned long length)
+{
+	return (driver != NULL ? lx_station_send(frame, length) : ENETDOWN);
+}

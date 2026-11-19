@@ -1,0 +1,25 @@
+[Defines]
+  INF_VERSION                    = 0x0001001B
+  BASE_NAME                      = UmiDisplayClockDxe
+  FILE_GUID                      = 8F6AA7CD-00B0-42CB-ADE1-10AE6C55DEB4
+  MODULE_TYPE                    = DXE_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = UmiDisplayClockEntry
+
+[Sources]
+  UmiDisplayClockDxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  QcomPkg/QcomPkg.dec
+
+[LibraryClasses]
+  DebugLib
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+
+[Protocols]
+  gEfiClockProtocolGuid
+
+[Depex]
+  gEfiClockProtocolGuid

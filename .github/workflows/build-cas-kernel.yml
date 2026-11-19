@@ -5,6 +5,9 @@ jobs:
   kernel:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
+    env:
+      XNU_SRC: ${{ github.workspace }}/out/xiaomi-mi-10/xnu
+      KERNEL: ${{ github.workspace }}/out/xiaomi-mi-10/xnu/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
     steps:
       - uses: actions/checkout@v4
       - name: deps
@@ -12,34 +15,55 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential clang lld llvm libssl-dev uuid-dev flex bison m4 perl python3 autoconf automake libtool pkg-config
       - name: theos
+        continue-on-error: true
         run: |
           git clone --depth 1 https://github.com/theos/theos "$HOME/theos"
-          cd "$HOME/theos" && yes | bash bin/install-theos
-      - name: xnu-source
+          cd "$HOME/theos"
+          ok=0
+          for i in 1 2 3; do
+            if yes | bash bin/install-theos; then ok=1; break; fi
+            sleep 30
+          done
+          [ "$ok" = 1 ] || echo "::warning::theos install did not finish (SDK optional)"
+      # The device layer (devices/xiaomi-mi-10, SM8250/kona): its own prepare.py makes the XNU tree,
+      # applies xnu/hakios.patch + the device overlay + xnu-device.patch + sched.patch, and writes the
+      # kernel configuration. It checks its own upstream-templates.sha256 first.
+      - name: xnu-source + device overlay
         run: |
-          xnu/apply.sh
+          python3 devices/xiaomi-mi-10/prepare.py kernel
+          ls -la "$XNU_SRC" | head
+          grep -c . "$XNU_SRC/bsd/dev/hakios.adreno.c" || true
       - name: deps-xnu
         run: |
           export THEOS="$HOME/theos"
           xnu-deps/setup.sh
-      - name: config
-        run: make defconfig
       - name: build
         run: |
           export THEOS="$HOME/theos"
+          export XNU_SRC="$PWD/out/xiaomi-mi-10/xnu"
+          export KERNEL="$XNU_SRC/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837"
           ulimit -s unlimited
-          make kernel JOBS=4
+          set +e
+          ./xnu-build.sh -j4 > /tmp/build.log 2>&1
+          echo "xnu-build exit: $?"
+          tail -60 /tmp/build.log
+          KERNEL="$KERNEL" tools/make-kernel.sh --judge /tmp/build.log
       - name: collect
         if: always()
         run: |
-          find xnu-src -name 'mach.*unstripped' | head -5 || true
+          ls -la out/xiaomi-mi-10/xnu/BUILD/obj/*/ 2>/dev/null | head -20 || true
+          find out/xiaomi-mi-10 -name 'mach.*unstripped' 2>/dev/null | head -5 || true
           mkdir -p out
-          K=$(find xnu-src -name 'mach.*unstripped' | head -1) || true
+          K=$(find out/xiaomi-mi-10 -name 'mach.*unstripped' 2>/dev/null | head -1) || true
+          [ -n "$K" ] || K=$(find out/xiaomi-mi-10 -name 'mach.development.bcm2837' 2>/dev/null | head -1) || true
           if [ -n "$K" ]; then
             llvm-strip-18 -S -o out/hakios-kernel "$K" || cp "$K" out/hakios-kernel
-            ls -lh out
+            ls -lh out/hakios-kernel
+          else
+            echo "::error::no kernel produced; see the build log above"
           fi
       - uses: actions/upload-artifact@v4
         with:
           name: cas-kernel
           path: out/hakios-kernel
+          if-no-files-found: warn

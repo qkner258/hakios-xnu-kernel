@@ -1,0 +1,13 @@
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1045,6 +1045,10 @@
+ 	const boolean_t cpus_boot_arg_present = PE_parse_boot_argn("cpus", &cpu_boot_arg, sizeof(cpu_boot_arg));
+ 	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
+ 	PE_parse_boot_argn("small_cores", &small_cores_apart, sizeof(small_cores_apart));
++	uint32_t amp = 0;
++	if (PE_parse_boot_argn("amp", &amp, sizeof(amp)) && amp == 1) {
++		small_cores_apart = 2;
++	}
+ 
+ 	// The cpus=N and cpumask=N boot args cannot be used simultaneously. Flag this
+ 	// so that we trigger a panic later in the boot process, once serial is enabled.

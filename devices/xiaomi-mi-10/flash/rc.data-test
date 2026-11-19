@@ -1,0 +1,6 @@
+# init runs these directly, before Apple launchd; no shell or var_store slots.
+/redwood/bin/vol_ls fs /
+/redwood/bin/vol_ls fs /private/var
+/redwood/bin/data-test
+/redwood/bin/vol_ls cat /private/var/umi-flash-test.txt
+/redwood/bin/vol_ls hash /private/var/umi-flash-test.txt

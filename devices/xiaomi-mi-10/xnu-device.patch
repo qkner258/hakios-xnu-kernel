@@ -1,0 +1,1534 @@
+--- a/bsd/conf/Makefile.arm64
++++ b/bsd/conf/Makefile.arm64
+@@ -1,3 +1,14 @@
++# Camera probe runs on a kernel thread without a userspace SIMD context.
++hakios.umi_camera.o_CFLAGS_ADD += -mgeneral-regs-only
++hakios.umi_camera_dma.o_CFLAGS_ADD += -mgeneral-regs-only
++
++# Size-optimize full drivers for Mi 10 early-boot layout headroom.
++hakios.umi_bluetooth.o_CFLAGS_ADD += -Os
++hakios.goodix.o_CFLAGS_ADD += -Os
++hakios.mpss.o_CFLAGS_ADD += -Os
++hakios.umi_modem.o_CFLAGS_ADD += -Os
++hakios.adreno.o_CFLAGS_ADD += -Os
++
+ ######################################################################
+ #BEGIN  Machine dependent Makefile fragment for arm
+ ######################################################################
+--- a/config/Makefile
++++ b/config/Makefile
+@@ -66,12 +66,15 @@
+ Kasan_EXPORTS := $(SRCROOT)/config/Kasan_enabled.$(KASAN_ARCH_SUFFIX).exports
+ endif
+ 
++# UMI links a device-specific subset of the XNU exports. Emit only symbols present
++# in this kernel so each generated kext symbol set matches the linked image.
+ define symbol_set_template
+ $(1)_EXPORTS := $$(addprefix $$(SOURCE)/,$$(filter $(1)%,$$(EXPORTS_FILES)))
+ $$(TARGET)/$(1).symbolset: MY_EXPORTS_ARGS := $$(foreach file,$$($(1)_EXPORTS),-export $$(file))
+ $$(TARGET)/$(1).symbolset: $$($(1)_EXPORTS) $$(TARGET)/allsymbols $$(KEXT_CREATE_SYMBOL_SET)
+ 	@$$(LOG_SYMBOLSET) "$(1)$$(Color0) ($$(ColorLF)$$(CURRENT_ARCH_CONFIG_LC)$$(Color0))"
+ 	$$(_v)$$(KEXT_CREATE_SYMBOL_SET)			\
++		-sect					\
+ 		$$(ARCH_FLAGS_$$(CURRENT_ARCH_CONFIG))	\
+ 		-import $$(TARGET)/allsymbols		\
+ 		$$(MY_EXPORTS_ARGS)			\
+@@ -119,19 +122,21 @@
+ 
+ check_all_exports: $(TARGET)/allsymbols $(KEXT_CREATE_SYMBOL_SET)
+ 	$(_v)$(KEXT_CREATE_SYMBOL_SET)					\
++		-sect				\
+ 		$(ARCH_FLAGS_$(CURRENT_ARCH_CONFIG))			\
+ 		-import $(TARGET)/allsymbols				\
+ 		$(foreach symbolset,$(filter-out Private,$(SYMBOL_COMPONENT_LIST)),	\
+ 			-export $(SOURCE)/$(symbolset).exports		\
+ 			-export $(SOURCE)/$(symbolset).$(EXPORT_SOURCE_ARCH_CONFIG_LC).exports)	\
+-		-output /dev/null $(_vstdout)
++		-output $(TARGET)/check_all_exports.symbolset $(_vstdout)
+ 	$(_v)$(KEXT_CREATE_SYMBOL_SET)					\
++		-sect				\
+ 		$(ARCH_FLAGS_$(CURRENT_ARCH_CONFIG))			\
+ 		-import $(TARGET)/allsymbols				\
+ 		$(foreach symbolset,$(filter-out Unsupported,$(SYMBOL_COMPONENT_LIST)),	\
+ 			-export $(SOURCE)/$(symbolset).exports		\
+ 			-export $(SOURCE)/$(symbolset).$(EXPORT_SOURCE_ARCH_CONFIG_LC).exports)	\
+-		-output /dev/null $(_vstdout)
++		-output $(TARGET)/check_all_exports.symbolset $(_vstdout)
+ 
+ $(OBJPATH)/$(MD_SUPPORTED_KPI_FILENAME): $(EXPORTS_FILES)
+ 	@$(LOG_SUPPORTED_KPI) "$(CURRENT_ARCH_CONFIG_LC)"
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -392,8 +392,8 @@
+ static void
+ arm64_implementation_specific_error(arm_saved_state_t *state, uint32_t esr, vm_offset_t far)
+ {
+-#pragma unused (state, esr, far)
+-	panic_plain("Unhandled implementation specific error\n");
++	panic("Unhandled implementation specific error ESR=%#x FAR=%p PC=%p",
++	    esr, (void *)far, (void *)get_saved_state_pc(state));
+ }
+ 
+ #if CONFIG_KERNEL_INTEGRITY
+@@ -439,9 +439,26 @@
+ #pragma clang diagnostic pop
+ #endif
+ 
++/*
++ * UMI: a platform error -- an SError, or a synchronous abort the platform layer takes -- is the
++ * one fault known here to end this kernel with no readable line. A panic's own text goes to the
++ * message and panic buffers, which reach the loader's live log only from loader_return(), and on
++ * this port the panic path itself has stopped short of that (a read of the radio's registers
++ * through the PCIe window; work/v29f/INVESTIGATION-hotspot-hang2.md). Said here, first, through
++ * the log the loader reads from another core: one bounded line, a lock that cannot be one this
++ * processor already holds, no allocation.
++ */
++extern void loader_log_line(const char *line);
++
+ static void
+ arm64_platform_error(arm_saved_state_t *state, uint32_t esr, vm_offset_t far, platform_error_source_t source)
+ {
++	char line[160];
++
++	snprintf(line, sizeof(line), "lx: PLATFORM ERROR esr=%#x far=%#llx elr=%#llx source=%d\n", esr,
++	    (unsigned long long)far, (unsigned long long)get_saved_state_pc(state), (int)source);
++	loader_log_line(line);
++
+ #if CONFIG_KERNEL_INTEGRITY
+ 	kernel_integrity_error_handler(esr, far);
+ #endif
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,7 +62,8 @@
+ 
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+ 
+-#define IO_MAP_SIZE            (8ul << 20)
++/* Qualcomm peripherals use permanent mappings for PCIe, GPU and audio. */
++#define IO_MAP_SIZE            (32ul << 20)
+ 
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
+@@ -82,3 +83,11 @@
++/* UMI camera diagnostics must not overrun the permanent MMIO window. */
++uint64_t umi_camera_iomap_free(void);
++uint64_t
++umi_camera_iomap_free(void)
++{
++	return io_submap && io_submap->size < IO_MAP_SIZE ? IO_MAP_SIZE - io_submap->size : 0;
++}
++
+ /*
+  * Allocate and map memory for devices that may need to be mapped before
+  * Mach VM is running. Allows caller to specify mapping protection
+--- a/bsd/kern/kern_shutdown.c
++++ b/bsd/kern/kern_shutdown.c
+@@ -172,6 +172,31 @@
+ extern int vm_swapfile_create_thread_running;
+ extern int vm_swapfile_gc_thread_running;
+ extern uint32_t cl_sparse_push_error;
++/* osfmk/arm64/loader_return.c and the drivers it stops on the way out */
++extern void loader_log_line(const char *line);
++extern void loader_return(void);
++extern void loader_prod_halt(boolean_t reboot);
++extern void hakios_adreno_stop(void);
++extern void hakios_wifi_stop(void);
++extern void hakios_adsp_stop(void);
++extern void hakios_mpss_stop(void);
++extern void hakios_usb_log_stop(void);
++extern kern_return_t kernel_thread_start(thread_continue_t continuation, void *parameter, thread_t *new_thread);
++extern void thread_deallocate(thread_t thread);
++/* v29y: sync + unmount on their own thread, waited on for a bounded time. On 11-13 19:51 the
++ * halt sat in this step for more than a minute (SpringBoard left spinning) and the phone never
++ * got back to Android. 0 idle, 1 syncing, 2 unmounting, 3 done. */
++static volatile int umi_rb_stage;
++static void
++umi_rb_unmount(void *arg, wait_result_t wr)
++{
++	(void)arg; (void)wr;
++	__atomic_store_n(&umi_rb_stage, 1, __ATOMIC_RELEASE);
++	sync((proc_t)NULL, (void *)NULL, (int *)NULL);
++	__atomic_store_n(&umi_rb_stage, 2, __ATOMIC_RELEASE);
++	vfs_unmountall(TRUE);
++	__atomic_store_n(&umi_rb_stage, 3, __ATOMIC_RELEASE);
++}
+ 
+ int
+ reboot_kernel(int howto, char *message)
+@@ -207,6 +232,54 @@
+ 	}
+ 
+ 	lck_mtx_unlock(&vm_swap_data_lock);
++
++	/*
++	 * UMI: nothing powers the phone off or restarts it. Halt and restart ("slide to power off",
++	 * launchd's reboot(2)) end the run the way loader_return_after does: back to the loader, and
++	 * from there to Android. launchd has already stopped every service; the one thing a power-off
++	 * must not lose is the data volume (HFS /private/var, the only volume written on the flash),
++	 * so it is synced and unmounted, and the rest of the generic teardown (processes, IOKit power
++	 * plane, network interfaces) is not run: the phone never came back from it.
++	 */
++	if ((howto & RB_PANIC) == 0) {
++		char line[192];
++		uint64_t ns;
++
++		snprintf(line, sizeof(line), "\n--- reboot(2) howto %#x from %s[%d]: %s: unmount, then back to the loader ---\n",
++		    howto, current_proc()->p_comm, proc_getpid(current_proc()), (howto & RB_HALT) ? "halt" : "restart");
++		loader_log_line(line);
++		startTime = mach_absolute_time();
++		if ((howto & RB_NOSYNC) == 0) {
++			thread_t t = THREAD_NULL;
++			unsigned waited = 0;
++			hakios_usb_log_stop();  /* its log files hold iocounts the unmount would wait on for ever */
++			__atomic_store_n(&umi_rb_stage, 0, __ATOMIC_RELEASE);
++			if (kernel_thread_start(umi_rb_unmount, NULL, &t) == KERN_SUCCESS) {
++				thread_deallocate(t);
++				/* sync gets up to 8 s, the whole step up to 12 s; then the loader anyway (HFS is journaled) */
++				while (__atomic_load_n(&umi_rb_stage, __ATOMIC_ACQUIRE) != 3 && waited < 12000 &&
++				    !(__atomic_load_n(&umi_rb_stage, __ATOMIC_ACQUIRE) <= 1 && waited >= 8000)) {
++					delay(10000);
++					waited += 10;
++				}
++			} else {
++				umi_rb_unmount(NULL, THREAD_AWAKENED);
++			}
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - startTime, &ns);
++		snprintf(line, sizeof(line), "reboot: file systems %s in %llu ms; back to the loader\n",
++		    (howto & RB_NOSYNC) ? "left alone" :
++		    __atomic_load_n(&umi_rb_stage, __ATOMIC_ACQUIRE) == 3 ? "synced and unmounted" :
++		    __atomic_load_n(&umi_rb_stage, __ATOMIC_ACQUIRE) == 2 ? "synced, unmount TIMED OUT" :
++		    "sync TIMED OUT", ns / NSEC_PER_MSEC);
++		loader_log_line(line);
++		hakios_adreno_stop();
++		hakios_wifi_stop();
++		hakios_adsp_stop();
++		hakios_mpss_stop();
++		loader_prod_halt((howto & RB_HALT) == 0);
++		loader_return();
++	}
+ 
+ 	/*
+ 	 * Notify the power management root domain that the system will shut down.
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -3320,20 +3320,15 @@
+ 			goto out;
+ 		}
+ 
+-		void* osent = csblob_os_entitlements_get(blob);
+-		if (!osent) {
+-			goto out;
+-		}
+-		CS_GenericBlob* xmlblob = NULL;
+-		if (amfi->OSEntitlements_get_xml(osent, &xmlblob)) {
+-			start = (void*)xmlblob;
+-			length = (size_t)ntohl(xmlblob->length);
+-		} else {
+-			goto out;
++		/*
++		 * The XML copy comes from AMFI's OSEntitlements object, which only the AMFI kext
++		 * creates; the stand-in (libkern/amfi/miniamfi.c) has none, and this answered every
++		 * peer query (libxpc, lockdownd: csops op 7) with nothing. Serve the signature's blob.
++		 */
++		error = csblob_get_entitlements(blob, &start, &length);
++		if (error == 0) {
++			error = csops_copy_token(start, length, usize, uaddr);
+ 		}
+-
+-		error = csops_copy_token(start, length, usize, uaddr);
+-		kfree_data(start, length);
+ 		goto out;
+ 	}
+ 	case CS_OPS_DER_ENTITLEMENTS_BLOB: {
+--- a/osfmk/vm/vm_object.c
++++ b/osfmk/vm/vm_object.c
+@@ -2096,7 +2096,8 @@
+  */
+ #if DEVELOPMENT || DEBUG
+ int madvise_free_debug = 0;
+-int madvise_free_debug_sometimes = 1;
++/* As RELEASE: no debug zero-fill of MADV_FREE* pages, so userland sees what a retail kernel gives it. */
++int madvise_free_debug_sometimes = 0;
+ #else /* DEBUG */
+ int madvise_free_debug = 0;
+ int madvise_free_debug_sometimes = 0;
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -8573,6 +8573,8 @@
+ }
+ 
+ #define CLONE_SNAPSHOT_FALLBACKS_ENABLED 1
++
++#include "hakios_clonefile_copy.inc"    /* clonefile_by_copy(): a clone where the file system has none */
+ 
+ /*
+  * Helper function for doing clones. The caller is expected to provide an
+@@ -8728,6 +8730,9 @@
+ #endif
+ 
+ 	error = VNOP_CLONEFILE(fvp, tdvp, &tvp, cnp, &nva, vnop_flags, ctx);
++	if (error == ENOTSUP && v_type != VDIR) {
++		error = clonefile_by_copy(fvp, tdvp, &tvp, cnp, &nva, ctx);
++	}
+ 
+ 	if (!error && tvp) {
+ 		int     update_flags = 0;
+--- a/osfmk/arm64/loader_return.c
++++ b/osfmk/arm64/loader_return.c
+@@ -84,7 +84,19 @@
+  */
+ static uint32_t loader_log_lock;
+ 
++/*
++ * How long a writer spins for the lock. Interrupts are off for as long as it holds it, so a wait
++ * that is too long is a processor that is not scheduling: it was ten million tries, which under
++ * contention is tens of milliseconds of that, every line. A holder that is gone for good (a panic
++ * inside this file) is what the try count is for, and a hundred thousand is long enough for that.
++ */
++#define LOADER_LOG_SPINS        100000
++
++static uint32_t loader_log_given_up;     /* acquisitions that ran out of tries: whoever held it was gone */
++static bool     loader_log_given_up_said;
++
+ static void loader_log_put_locked(char c);
++static void loader_log_note_given_up(void);
+ 
+ void
+ loader_log_putc(char c)
+@@ -97,9 +109,14 @@
+ 	}
+ 	daif = __builtin_arm_rsr64("DAIF");
+ 	__builtin_arm_wsr("DAIFSet", DAIFSC_IRQF | DAIFSC_FIQF);
+-	for (uint32_t tries = 0; !locked && tries < 10000000; tries++) {
++	for (uint32_t tries = 0; !locked && tries < LOADER_LOG_SPINS; tries++) {
+ 		locked = os_atomic_cmpxchg(&loader_log_lock, 0, 1, acquire);
+ 	}
++	if (locked) {
++		loader_log_note_given_up();
++	} else {
++		os_atomic_inc(&loader_log_given_up, relaxed);
++	}
+ 	loader_log_put_locked(c);
+ 	if (locked) {
+ 		os_atomic_store(&loader_log_lock, 0, release);
+@@ -121,9 +138,19 @@
+ 
++	{
++		/* UMI: the same line on the panel while the boot lasts (bsd/dev/umi_bootlog.c) */
++		extern void hakios_bootlog_feed(const char *text, int len);
++		hakios_bootlog_feed(line, -1);
++	}
+ 	daif = __builtin_arm_rsr64("DAIF");
+ 	__builtin_arm_wsr("DAIFSet", DAIFSC_IRQF | DAIFSC_FIQF);
+-	for (uint32_t tries = 0; !locked && tries < 10000000; tries++) {
++	for (uint32_t tries = 0; !locked && tries < LOADER_LOG_SPINS; tries++) {
+ 		locked = os_atomic_cmpxchg(&loader_log_lock, 0, 1, acquire);
+ 	}
++	if (locked) {
++		loader_log_note_given_up();
++	} else {
++		os_atomic_inc(&loader_log_given_up, relaxed);
++	}
+ 	for (; *line != 0; line++) {
+ 		if (*line != '\r') {
+ 			loader_log_put_locked(*line);
+@@ -135,7 +157,26 @@
+ 	__builtin_arm_wsr64("DAIF", daif);
+ }
+ 
++/*
++ * Under the lock, once: the log has been written without it, and a reader of it should know why
++ * lines of different processors are in each other. Said in the log itself, where it belongs, and
++ * only by whoever does have the lock -- the one who did not has nothing to write it in order with.
++ */
+ static void
++loader_log_note_given_up(void)
++{
++	static const char note[] = "\n--- the log was written without its lock: whoever held it was gone ---\n";
++
++	if (loader_log_given_up == 0 || loader_log_given_up_said) {
++		return;
++	}
++	loader_log_given_up_said = true;
++	for (const char *c = note; *c != 0; c++) {
++		loader_log_put_locked(*c);
++	}
++}
++
++static void
+ loader_log_put_locked(char c)
+ {
+ 	if (loader_log_linear || loader_log_len < LOADER_LOG_HEAD) {
+@@ -179,6 +220,7 @@
+ 
+ /* Patched by the loader: { magic, PA of its return stub, checkpoint to stop at, PA - VA }. See start.s. */
+ extern uint64_t loader_stub_slot[4];
++#include "umi_loader_prod.inc"
+ 
+ /*
+  * For a loader that watches from another processor core while the kernel runs (it starts the
+@@ -200,6 +242,8 @@
+ 	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
+ 	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
+ 	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
++	uint64_t magic3;                /* "XNULIVE3": what follows is there too (a loader may meet an older kernel) */
++	volatile uint64_t mmio;         /* (a kernel virtual address) the radio's last accesses, or 0: struct lx_mmio_ring */
+ };
+ 
+ /*
+@@ -215,8 +259,21 @@
+ 	.log_wrapped = &loader_log_wrapped, .log_head = LOADER_LOG_HEAD, .log_ring = LOADER_LOG_RING,
+ 	.recording = loader_recording,
+ 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
++	.magic3 = 0x334556494c554e58ULL,
+ };
+ 
++/*
++ * The radio's last accesses of the chip's registers, offered by the driver's object when it
++ * starts (bsd/dev/hakios.lx.c: lx_os_mmio_ring(); the structure is bsd/sys/hakios.lx.h). The
++ * loader reads it on another processor if this kernel stops answering: the entry still pending
++ * is the access that never came back (devices/xiaomi-mi-10/loader/loader.c, log_of_hung_mmio()).
++ */
++void
++loader_live_mmio(const void *ring)
++{
++	loader_live.mmio = (uint64_t)(uintptr_t)ring;
++}
++
+ /* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */
+ static inline uint64_t
+ static_kvtophys(const void *va)
+@@ -363,6 +420,14 @@
++extern void hakios_lx_quiesce_registers(void);  /* bsd/dev/hakios.lx.c: the Wi-Fi driver's registers refused from now on */
+ void
+ loader_return(void)
+ {
++	/*
++	 * Said before the work, and after each part of it that has been known to take the machine
++	 * with it: a run that ends with no further word then says where it ended, which no line of
++	 * the kernel's own does -- a panic that does not get as far as the loader writes nothing
++	 * anybody outside can read.
++	 */
++	loader_log_line("\nloader_return: the way back to the loader is being taken\n");
+ #if defined(GENERIC_PSCI_SMP)
+ 	/*
+ 	 * With more than one processor: the others switch themselves off first, and the rest of
+@@ -370,6 +434,8 @@
+ 	 * on that processor only (on another one it has it call loader_return() in its turn).
+ 	 */
++	hakios_lx_quiesce_registers();  /* the Wi-Fi driver's bus shut before the others stop: no lock, no sleep */
+ 	psci_smp_stop_others();
++	loader_log_line("loader_return: the other processors are stopped (or this one is waiting to be)\n");
+ #endif
+ 	hakios_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
+ 	hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
+@@ -381,6 +448,7 @@
+ 	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
+ 	hakios_camera_quiesce();       /* the camera powered down, if it was powered up */
+ 	hakios_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
++	loader_log_line("loader_return: the drivers are quiet; the log is collected\n");
+ 	/*
+ 	 * A panic's text is first collected in the panic buffer and only later
+ 	 * flushed to the console; if the console itself is what failed, that
+@@ -397,6 +465,7 @@
+ 			loader_log_putc(*c);
+ 		}
+ 	}
++	umi_prod_finish();
+ 	loader_jump(0, 0);
+ }
+ 
+@@ -461,6 +530,7 @@
+ 	uint32_t seconds = 0;
+ 	uint64_t deadline;
+ 
++	if (loader_is_production()) return;
+ 	if (!PE_parse_boot_argn("loader_return_after", &seconds, sizeof(seconds)) || seconds == 0) {
+ 		return;
+ 	}
+@@ -500,6 +570,7 @@
+ static void
+ loader_stop_poll_init(void)
+ {
++	if (loader_is_production()) return;
+ 	loader_stop_call = thread_call_allocate(loader_stop_poll, NULL);
+ 	loader_stop_poll(NULL, NULL);
+ }
+@@ -591,6 +662,7 @@
+ hv_wdt_pet_init(void)
+ {
+ 	PE_parse_boot_argn("hv_wdt_pet", &hv_wdt_enabled, sizeof(hv_wdt_enabled));
++	if (loader_is_production()) hv_wdt_enabled = 0; /* CPU0 alone feeds, on heartbeat progress. */
+ 	hv_wdt_call = thread_call_allocate(hv_wdt_pet, NULL);
+ 	hv_wdt_pet(NULL, NULL);
+ }
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -735,12 +735,17 @@
+ }
+ 
+ extern void loader_return(void);
++extern void loader_prod_halt(boolean_t reboot);
+ extern void hakios_adreno_stop(void);
++extern void loader_log_line(const char *line);	/* (a halt takes the machine with it: said before it does) */
+ 
+ __attribute__((noreturn))
+ void
+ halt_all_cpus(boolean_t reboot)
+ {
++	loader_log_line(reboot ? "halt: halt_all_cpus is taking the machine down for a restart\n" :
++	    "halt: halt_all_cpus is taking the machine down\n");
++	loader_prod_halt(reboot);
+ 	if (reboot) {
+ 		printf("MACH Reboot\n");
+ 		PEHaltRestart(kPERestartCPU);
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1068,6 +1068,24 @@
+     uint64_t panic_options_mask, void *panic_data_ptr, unsigned long panic_caller)
+ {
+ #pragma clang diagnostic pop
++
++	/*
++	 * UMI: every panic wrapper comes here, and the panic's text reaches the loader's live log
++	 * only from loader_return() -- which on this port the path below has been known not to get
++	 * to. One bounded line from the log the loader reads from another core, before anything
++	 * here can wait on a lock or another processor.
++	 */
++	{
++		/* (this file names vsnprintf rather than including libkern.h; snprintf the same way) */
++		extern int snprintf(char *, size_t, const char *, ...);
++		extern void loader_log_line(const char *line);
++		extern void hakios_bootlog_panic(void);
++		char line[128];
++
++		snprintf(line, sizeof(line), "panic: the panic path is entered (called from %#lx)\n", panic_caller);
++		loader_log_line(line);
++		hakios_bootlog_panic();
++	}
+ 
+ #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
+ 	read_lbr();
+@@ -1148,10 +1164,13 @@
+ }
+ 
+ extern void loader_return(void);
++extern void loader_log_line(const char *line);
+ 
+ void
+ panic_spin_forever(void)
+ {
++	/* UMI: the last line of a panic that does get this far, before the way back to the loader. */
++	loader_log_line("panic: panic_stop() reached; the way back to the loader begins\n");
+ 	loader_return();
+ 	for (;;) {
+ #if defined(__arm__) || defined(__arm64__)
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -513,6 +513,11 @@
+ console_write(char *str, int size)
+ {
+ 	assert(str != NULL);
++	if (str != NULL && size > 0) {
++		/* UMI: the line on the panel while the boot lasts (bsd/dev/umi_bootlog.c) */
++		extern void hakios_bootlog_feed(const char *text, int len);
++		hakios_bootlog_feed(str, size);
++	}
+ 
+ 	char *write_ptr = NULL;
+ 	int chunk_size = CPU_CONS_BUF_SIZE;
+--- a/osfmk/arm64/loader_return.c
++++ b/osfmk/arm64/loader_return.c
+@@ -26,6 +26,9 @@
+ #include <pexpert/arm64/board_config.h>
+ #include <vm/vm_page.h>
+ #include <vm/vm_compressor.h>
++/* UMI: the per-processor breadcrumbs (osfmk/arm64/umi_cpu_pc.h), defined here because this
++ * is the one file that also offers them to the loader below (loader_live.cpu_pc). */
++#include "umi_cpu_pc.inc"
+ 
+ /*
+  * The console log handed back to the loader. A long session writes more than fits, and both
+@@ -249,6 +252,8 @@
+ 	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
+ 	uint64_t magic3;                /* "XNULIVE3": what follows is there too (a loader may meet an older kernel) */
+ 	volatile uint64_t mmio;         /* (a kernel virtual address) the radio's last accesses, or 0: struct lx_mmio_ring */
++	uint64_t magic4;                /* "XNULIVE4": ... and so is this (a loader may meet an older kernel) */
++	uint64_t cpu_pc;                /* (a kernel virtual address) where each processor was, or 0: struct lx_cpu_breadcrumbs */
+ };
+ 
+ /*
+@@ -265,6 +270,8 @@
+ 	.recording = loader_recording,
+ 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
+ 	.magic3 = 0x334556494c554e58ULL,
++	.magic4 = 0x344556494c554e58ULL,
++	.cpu_pc = (uint64_t)(uintptr_t)&umi_cpu_pc_table,
+ };
+ 
+ /*
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -37,6 +37,8 @@
+ #include <arm64/machine_machdep.h>
+ #include <arm64/monotonic.h>
+ #include <arm64/instructions.h>
++/* UMI: the per-processor breadcrumbs the interrupt path below writes (osfmk/arm64/umi_cpu_pc.h) */
++#include <arm64/umi_cpu_pc.h>
+ 
+ #include <kern/debug.h>
+ #include <kern/restartable.h>
+@@ -2065,6 +2067,15 @@
+ static void
+ sleh_interrupt_handler_prologue(arm_saved_state_t *state, unsigned int type)
+ {
++	/*
++	 * UMI: where this processor was interrupted, and whether it was user code, before anything
++	 * else in this path can wait: the loader reads it from another processor once the machine has
++	 * stopped, when there is no panic and no line to say where it stopped (umi_cpu_pc.h).
++	 * Eight stores in this path, on every interrupt.
++	 */
++	umi_cpu_pc_note_irq(get_saved_state_pc(state), get_saved_state_lr(state), get_saved_state_sp(state),
++	    PSR64_IS_USER(get_saved_state_cpsr(state)));
++
+ 	boolean_t is_user = PSR64_IS_USER(get_saved_state_cpsr(state));
+ 
+ 	task_vtimer_check(current_thread());
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -28,6 +28,8 @@
+ 
+ #include <arm64/machine_machdep.h>
+ #include <arm64/proc_reg.h>
++/* UMI: a processor asleep in WFI is not a processor that stopped (osfmk/arm64/umi_cpu_pc.h) */
++#include <arm64/umi_cpu_pc.h>
+ #include <arm/machine_cpu.h>
+ #include <arm/cpu_internal.h>
+ #include <arm/cpuid.h>
+@@ -338,6 +340,7 @@
+ 	 * Idle_load_context()
+ 	 */
+ 	assert((__builtin_arm_rsr("DAIF") & (DAIF_IRQF | DAIF_FIQF)) == (DAIF_IRQF | DAIF_FIQF));
++	umi_cpu_pc_note_idle_enter();
+ 	/* Check for, and act on, a WFE recommendation.
+ 	 * Bypasses context spill/fill for a minor perf. increment.
+ 	 * May unmask and restore IRQ+FIQ mask.
+@@ -349,6 +352,7 @@
+ 		 */
+ 		Idle_context();
+ 	}
++	umi_cpu_pc_note_idle_exit();
+ 	__builtin_arm_wsr("DAIFClr", (DAIFSC_IRQF | DAIFSC_FIQF));
+ }
+ 
+--- a/osfmk/arm/locks_arm.c
++++ b/osfmk/arm/locks_arm.c
+@@ -85,6 +85,9 @@
+ 
+ #include <arm/cpu_data_internal.h>
+ #include <arm64/proc_reg.h>
++/* UMI: the caller and the lock of the spin about to be taken, for a hung machine's report
++ * (osfmk/arm64/umi_cpu_pc.h); the wait itself is marked by hw_lock_lock_contended(). */
++#include <arm64/umi_cpu_pc.h>
+ #include <arm/smp.h>
+ #include <machine/atomic.h>
+ #include <machine/machine_cpu.h>
+@@ -819,6 +822,8 @@
+ void
+ lck_spin_lock(lck_spin_t *lock)
+ {
++	umi_cpu_pc_note_lock((uint64_t)(uintptr_t)__builtin_return_address(0),
++	    (uint64_t)(uintptr_t)lock);
+ 	lck_spin_verify(lock);
+ 	hw_lock_lock(&lock->hwlock, LCK_GRP_NULL);
+ }
+@@ -827,6 +832,8 @@
+ lck_spin_lock_grp(lck_spin_t *lock, lck_grp_t *grp)
+ {
+ #pragma unused(grp)
++	umi_cpu_pc_note_lock((uint64_t)(uintptr_t)__builtin_return_address(0),
++	    (uint64_t)(uintptr_t)lock);
+ 	lck_spin_verify(lock);
+ 	hw_lock_lock(&lock->hwlock, grp);
+ }
+@@ -834,6 +841,8 @@
+ void
+ lck_spin_lock_nopreempt(lck_spin_t *lock)
+ {
++	umi_cpu_pc_note_lock((uint64_t)(uintptr_t)__builtin_return_address(0),
++	    (uint64_t)(uintptr_t)lock);
+ 	lck_spin_verify(lock);
+ 	hw_lock_lock_nopreempt(&lock->hwlock, LCK_GRP_NULL);
+ }
+@@ -842,6 +851,8 @@
+ lck_spin_lock_nopreempt_grp(lck_spin_t *lock, lck_grp_t *grp)
+ {
+ #pragma unused(grp)
++	umi_cpu_pc_note_lock((uint64_t)(uintptr_t)__builtin_return_address(0),
++	    (uint64_t)(uintptr_t)lock);
+ 	lck_spin_verify(lock);
+ 	hw_lock_lock_nopreempt(&lock->hwlock, grp);
+ }
+--- a/osfmk/kern/locks.c
++++ b/osfmk/kern/locks.c
+@@ -79,6 +79,9 @@
+ #include <machine/machine_cpu.h>
+ #include <string.h>
+ #include <vm/pmap.h>
++/* UMI: a spin that has lasted too long is what a report of a dead machine must name
++ * (osfmk/arm64/umi_cpu_pc.h: the caller and the lock come from lck_spin_lock()). */
++#include <arm64/umi_cpu_pc.h>
+ 
+ #include <sys/kdebug.h>
+ 
+@@ -546,6 +549,17 @@
+ 	hw_spin_timeout_t to = hw_spin_compute_timeout(pol);
+ 	hw_spin_state_t   state = { };
+ 	hw_lock_status_t  rc = HW_LOCK_CONTENDED;
++	/*
++	 * UMI: this processor is now waiting for a lock that is held. If the wait turns into something
++	 * a report has to name, lck_spin_lock() has already left the caller and the lock in this
++	 * processor's breadcrumb (osfmk/arm64/umi_cpu_pc.h); all this path adds is the mark, once,
++	 * with a plain store. None of it is written for the PPL, whose world cannot reach kernel
++	 * globals.
++	 */
++	const boolean_t in_ppl = hw_spin_in_ppl(to);
++	const uint64_t spin_begin = umi_cpu_pc_now_ns();
++	uint32_t spin_rounds = 0;
++	boolean_t spin_noted = false;
+ 
+ 	if (HW_LOCK_STATE_TO_THREAD(lock->lock_data) ==
+ 	    HW_LOCK_STATE_TO_THREAD(data) && LOCK_CORRECTNESS_PANIC()) {
+@@ -562,7 +576,7 @@
+ 	}
+ #endif /* CONFIG_DTRACE || LOCK_STATS */
+ 
+-	if (!hw_spin_in_ppl(to)) {
++	if (!in_ppl) {
+ 		/*
+ 		 * This code is used by the PPL and can't write to globals.
+ 		 */
+@@ -578,9 +592,20 @@
+ 				goto end;
+ 			}
+ 		}
++		/* (once per episode; the clock is asked every 64 rounds, so a contended lock that is
++		 * released quickly pays a counter, not a clock read) */
++		if (__improbable(!in_ppl && !spin_noted && (++spin_rounds & 63) == 0)) {
++			if (umi_cpu_pc_now_ns() - spin_begin >= UMI_CPU_PC_SPIN_NS) {
++				umi_cpu_pc_note_spin();
++				spin_noted = true;
++			}
++		}
+ 	} while (hw_spin_should_keep_spinning(lock, pol, to, &state));
+ 
+ end:
++	if (spin_noted) {
++		umi_cpu_pc_note_spin_done();
++	}
+ #if CONFIG_DTRACE || LOCK_STATS
+ 	if (__improbable(stat_enabled)) {
+ 		lck_grp_spin_update_spin(lock LCK_GRP_ARG(grp),
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -86,6 +86,16 @@
+ #include <pexpert/arm64/boot.h>
+ #include <arm64/ppl/sart.h>
+ #include <arm64/ppl/uat.h>
++
++#if defined(HAKIOS_UMI) && HAKIOS_UMI
++/* UMI: the per-processor breadcrumbs the teardown paths below write, so that a machine that stops
++ * between a broadcast invalidation and the "dsb ish" that waits for it names the pmap, its ASID and
++ * the process that owned it (osfmk/arm64/umi_cpu_pc.h; six stores and a clock read per phase). */
++#include <arm64/umi_cpu_pc.h>
++#define UMI_PMAP_TEARDOWN_NOTE(phase, pmap_to_note) umi_pmap_teardown_note((phase), (pmap_to_note))
++#else
++#define UMI_PMAP_TEARDOWN_NOTE(phase, pmap_to_note) do { } while (0)
++#endif
+ 
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
+ #include <arm64/amcc_rorgn.h>
+@@ -3160,8 +3170,55 @@
+  *                   + purgeable_nonvolatile_compressed
+  *                   + page_table)
+  * where "alternate_accounting" includes "iokit" and "purgeable" memory.
++ */
++
++#if defined(HAKIOS_UMI) && HAKIOS_UMI
++/*
++ * UMI: say what a pmap teardown is doing, four times: before the invalidations of a dying address
++ * space, after the "tlbi ...is" that issues them, after the "dsb ish" that cannot return until
++ * every DVM participant (the SMMUs' TCUs among them) has answered, and after the "isb" that
++ * follows it. A processor that stops between the second and the third is then a processor waiting
++ * for the interconnect; one that stops between the third and the fourth is a processor whose
++ * invalidation did complete (the shape of the v29z hang: stopped on the isb, phase still at 2);
++ * and the entry names the pmap, its ASID and the process that owned it (osfmk/arm64/umi_cpu_pc.h).
++ *
++ * Called only from pmap_destroy_internal() and pmap_unmap_commpage(), which run once per address
++ * space: four stores and a clock read each, no lock, no log line, no list walk.
++ */
++static void
++umi_pmap_teardown_note(uint32_t phase, pmap_t pmap)
++{
++#if XNU_MONITOR
++	/* (the pmap code of a monitor build runs in the PPL, whose world cannot reach kernel globals) */
++	(void)phase;
++	(void)pmap;
++#elif MACH_ASSERT
++	/* (pmap_set_process() keeps these for exactly this kind of question; a kernel pmap has none) */
++	const int pid = pmap->pmap_pid;
++
++	umi_cpu_pc_note_pmap(phase, (uint64_t)(uintptr_t)pmap, (uint32_t)pmap->hw_asid,
++	    pid > 0 ? (uint32_t)pid : 0, pmap->pmap_procname);
++#else
++	umi_cpu_pc_note_pmap(phase, (uint64_t)(uintptr_t)pmap, (uint32_t)pmap->hw_asid, 0, NULL);
++#endif
++}
++#endif /* defined(HAKIOS_UMI) && HAKIOS_UMI */
++
++#if defined(HAKIOS_UMI) && HAKIOS_UMI
++/*
++ * UMI: the exit ring, for proc_exit() (bsd/kern/kern_exit.c). That side cannot include the
++ * breadcrumb header (bsd/ does not get osfmk's private include path), so the table stays here and
++ * it calls this: one process exit, six stores and one atomic, no lock and no log line.
+  */
++void umi_cpu_pc_record_exit(uint64_t pid, const char *comm);
+ 
++void
++umi_cpu_pc_record_exit(uint64_t pid, const char *comm)
++{
++	umi_cpu_pc_note_exit(pid, comm);
++}
++#endif /* defined(HAKIOS_UMI) && HAKIOS_UMI */
++
+ /*
+  *	Retire the given physical map from service.
+  *	Should only be called if the map contains
+@@ -3240,11 +3295,21 @@
+ 	assert((tt_free_entry_t*)pmap->tt_entry_free == NULL);
+
+ 	if (__improbable(pmap->type == PMAP_TYPE_NESTED)) {
++		UMI_PMAP_TEARDOWN_NOTE(LX_PMAP_PHASE_ENTER, pmap);
+ 		pmap_get_pt_ops(pmap)->flush_tlb_region_async(pmap->nested_region_addr, pmap->nested_region_size, pmap, false);
++		UMI_PMAP_TEARDOWN_NOTE(LX_PMAP_PHASE_TLBI, pmap);
+-		sync_tlb_flush();
++		__builtin_arm_dsb(DSB_ISH);
++		UMI_PMAP_TEARDOWN_NOTE(LX_PMAP_PHASE_DVM_DONE, pmap);
++		__builtin_arm_isb(ISB_SY);
++		UMI_PMAP_TEARDOWN_NOTE(LX_PMAP_PHASE_DONE, pmap);
+ 	} else {
++		UMI_PMAP_TEARDOWN_NOTE(LX_PMAP_PHASE_ENTER, pmap);
+ 		pmap_get_pt_ops(pmap)->flush_tlb_async(pmap);
++		UMI_PMAP_TEARDOWN_NOTE(LX_PMAP_PHASE_TLBI, pmap);
+-		sync_tlb_flush();
++		__builtin_arm_dsb(DSB_ISH);
++		UMI_PMAP_TEARDOWN_NOTE(LX_PMAP_PHASE_DVM_DONE, pmap);
++		__builtin_arm_isb(ISB_SY);
++		UMI_PMAP_TEARDOWN_NOTE(LX_PMAP_PHASE_DONE, pmap);
+ 		/* return its asid to the pool */
+ 		pmap_get_pt_ops(pmap)->free_id(pmap);
+ 		if (pmap->nested_pmap != NULL) {
+@@ -11145,8 +11210,13 @@
+ 	*ttep = ARM_TTE_EMPTY;
+ 	FLUSH_PTE_STRONG();
+
++	UMI_PMAP_TEARDOWN_NOTE(LX_PMAP_PHASE_ENTER, pmap);
+ 	flush_mmu_tlb_region_asid_async(commpage_vaddr, PAGE_SIZE, pmap, false);
++	UMI_PMAP_TEARDOWN_NOTE(LX_PMAP_PHASE_TLBI, pmap);
+-	sync_tlb_flush();
++	__builtin_arm_dsb(DSB_ISH);
++	UMI_PMAP_TEARDOWN_NOTE(LX_PMAP_PHASE_DVM_DONE, pmap);
++	__builtin_arm_isb(ISB_SY);
++	UMI_PMAP_TEARDOWN_NOTE(LX_PMAP_PHASE_DONE, pmap);
+ }
+ 
+ void
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -140,6 +140,17 @@
+ 
+ #include <kdp/kdp_dyld.h>
+ 
++#if defined(HAKIOS_UMI) && HAKIOS_UMI
++/*
++ * UMI: the eight newest exits go into the same table as the per-processor breadcrumbs, so that a
++ * pmap teardown found in flight on a hung machine can be matched to the process it belonged to.
++ * The table's header lives in osfmk/arm64, which this side cannot see (bsd/ does not get osfmk's
++ * private include path); osfmk/arm/pmap/pmap.c, which already includes it, offers the one call.
++ * Six stores and one atomic in a path that runs once per process.
++ */
++extern void umi_cpu_pc_record_exit(uint64_t pid, const char *comm);
++#endif
++
+ #if SYSV_SHM
+ #include <sys/shm_internal.h>   /* shmexit */
+ #endif /* SYSV_SHM */
+@@ -2098,6 +2109,16 @@
+ 
+ 	uth = current_uthread();
+ 
++#if defined(HAKIOS_UMI) && HAKIOS_UMI
++	/*
++	 * UMI: write down who is going, before any of the teardown below can run (and, on a machine
++	 * that stops in the middle of it, long before a report can be printed). The exit ring is read
++	 * by the loader beside the per-processor breadcrumbs; it is the "for which process" of the
++	 * pmap invalidation those entries record (osfmk/arm64/umi_cpu_pc.h, through osfmk's wrapper).
++	 */
++	umi_cpu_pc_record_exit((uint64_t)proc_getpid(p), p->p_comm);
++#endif
++
+ 	proc_lock(p);
+ 	proc_transstart(p, 1, 0);
+ 	if (!(p->p_lflag & P_LEXIT)) {
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -102,6 +102,9 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <machine/machine_cpu.h>
+ #include <machine/pal_routines.h>
++/* UMI: the kernel's debugger entry is written into the per-processor breadcrumbs, so that a
++ * machine stopped inside it can be named from another processor (osfmk/arm64/umi_cpu_pc.h). */
++#include <arm64/umi_cpu_pc.h>
+ 
+ #include <sys/kdebug.h>
+ #include <libkern/OSKextLibPrivate.h>
+@@ -823,6 +826,15 @@
+ 	spl_t previous_interrupts_state;
+ 	boolean_t old_doprnt_hide_pointers = doprnt_hide_pointers;
+ 
++	/*
++	 * UMI: this is one way into the debugger, and on this port the one that prints nothing (the
++	 * "Debugger called:" line is x86's). The hook is the outermost, so it is the one that keeps
++	 * the entry: a hang here -- every processor parked on the debugger's signal, no panic, no
++	 * line -- then says which processor began it and with which call (umi_cpu_pc.h, version 5;
++	 * work/v29i/INVESTIGATION-hotspot-hang-v30.md §4.1).
++	 */
++	umi_cpu_pc_note_debugger(LX_DBG_KIND_DEBUGGER, 0, (uint64_t)debugger_caller, 0);
++
+ #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
+ 	read_lbr();
+ #endif
+@@ -1472,6 +1484,11 @@
+ 	unsigned int initial_not_in_kdp = not_in_kdp;
+ 	kern_return_t ret;
+ 	debugger_op db_prev_op = debugger_current_op;
++
++	/* UMI: every entry into the kernel's debugger passes here, and this is the one place with the
++	 * exception and its code; the pc is the hook's above (this one has no saved state to read it
++	 * from on the arm64 path that matters). */
++	umi_cpu_pc_note_debugger_why(exception, code, subcode, 0);
+ 
+ 	DEBUGGER_TRAP_TIMESTAMP(0);
+ 
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -53,6 +53,9 @@
+ #endif
+ #include <machine/atomic.h>
+ #include <machine/trap.h>
++/* UMI: the debugger's cross-call is written into the per-processor breadcrumbs, both ends of it
++ * (osfmk/arm64/umi_cpu_pc.h). */
++#include <arm64/umi_cpu_pc.h>
+ #include <kern/spl.h>
+ #include <pexpert/pexpert.h>
+ #include <kdp/kdp_callout.h>
+@@ -932,6 +935,12 @@
+ 		return KERN_SUCCESS;
+ 	}
+ 
++	/* UMI: this is the processor the debugger was entered on: it is about to send every other one
++	 * a SIGPdebug and wait for the answers. Written before the first signal, so a machine stopped
++	 * in the wait names the processor that began it (umi_cpu_pc.h, version 5). */
++	umi_cpu_pc_note_debugger(LX_DBG_KIND_XCALL_ENTER, LX_DBG_ROLE_INITIATOR,
++	    (uint64_t)(uintptr_t)__builtin_return_address(0), 0);
++
+ 	/*
+ 	 * If debugger_sync is not 0, someone responded excessively late to the last
+ 	 * debug request (we zero the sync variable in the return function).  Zero it
+@@ -1112,6 +1121,9 @@
+ 
+ 	mp_kdp_trap = 0;
+ 	debugger_sync = 0;
++	/* UMI: the debugger is over on this processor too -- the hook that opened it was the outermost
++	 * (umi_cpu_pc.h); a machine that never gets here keeps its entry for the report. */
++	umi_cpu_pc_note_debugger_done(LX_DBG_ROLE_INITIATOR);
+ 
+ 	max_mabs_time = os_atomic_load(&debug_ack_timeout, relaxed);
+ 
+@@ -1183,6 +1195,11 @@
+ 	vm_offset_t             kstackptr = 0;
+ 	arm_saved_state_t       *regs = (arm_saved_state_t *) ctx;
+ 
++	/* UMI: a receiving end of the debugger's cross-call: the pc it interrupted, and the wait below,
++	 * which does not return while the machine is stopped this way (umi_cpu_pc.h, version 5). */
++	umi_cpu_pc_note_debugger(LX_DBG_KIND_XCALL_WAIT, LX_DBG_ROLE_RECEIVER,
++	    regs != NULL ? (uint64_t)get_saved_state_pc(regs) : 0, 0);
++
+ 	if (regs != NULL) {
+ #if defined(__arm64__)
+ 		current_cpu_datap()->ipi_pc = (uint64_t)get_saved_state_pc(regs);
+@@ -1236,6 +1253,8 @@
+ 	 * all of the CPUs to exit the above loop before continuing.
+ 	 */
+ 	os_atomic_dec(&debug_cpus_spinning, relaxed);
++	/* UMI: out of the wait, so this processor is no longer parked in the debugger. */
++	umi_cpu_pc_note_debugger_done(LX_DBG_ROLE_RECEIVER);
+ 
+ #if SCHED_HYGIENE_DEBUG
+ 	/*
+--- a/osfmk/arm/cpu_common.c
++++ b/osfmk/arm/cpu_common.c
+@@ -56,6 +56,8 @@
+ #include <sys/kdebug.h>
+ #include <arm/machine_routines.h>
+ #include <arm64/proc_reg.h>
++/* UMI: the broadcast xcall a processor is about to run goes into the breadcrumbs (umi_cpu_pc.h). */
++#include <arm64/umi_cpu_pc.h>
+ #include <libkern/OSAtomic.h>
+ 
+ SECURITY_READ_ONLY_LATE(struct percpu_base) percpu_base;
+@@ -227,6 +229,10 @@
+ 		cpu_data_ptr->cpu_xcall_p1 = NULL;
+ 		os_atomic_thread_fence(acq_rel);
+ 		os_atomic_andnot(&cpu_data_ptr->cpu_signal, SIGPxcall, relaxed);
++		/* UMI: the function this processor is about to run, so that a machine stopped with every
++		 * processor on the debugger's signal can also name the broadcast it was in, when nothing
++		 * entered the debugger at all (umi_cpu_pc.h, version 5; v30 investigation §4.2, H3). */
++		umi_cpu_pc_note_xcall((uint64_t)(uintptr_t)xfunc, (uint64_t)(uintptr_t)xparam);
+ 		xfunc(xparam);
+ 		INTERRUPT_MASKED_DEBUG_END();
+ 	}
+@@ -238,6 +244,8 @@
+ 		cpu_data_ptr->cpu_imm_xcall_p1 = NULL;
+ 		os_atomic_thread_fence(acq_rel);
+ 		os_atomic_andnot(&cpu_data_ptr->cpu_signal, SIGPxcallImm, relaxed);
++		/* UMI: ... the same for the immediate-xcall list (see above). */
++		umi_cpu_pc_note_xcall((uint64_t)(uintptr_t)xfunc, (uint64_t)(uintptr_t)xparam);
+ 		xfunc(xparam);
+ 		INTERRUPT_MASKED_DEBUG_END();
+ 	}
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -513,6 +513,10 @@
+ 	{
+ 		uint32_t instr = *((uint32_t*)get_saved_state_pc(state));
+ 		if (IS_ARM_GDB_TRAP(instr)) {
++			/* UMI: a kernel BRK is one way into the debugger, and on this port the one that
++			 * prints nothing; the hook names it, with the pc and the instruction, before
++			 * DebuggerCall() can wait on another processor (umi_cpu_pc.h, version 5). */
++			umi_cpu_pc_note_debugger(LX_DBG_KIND_BRK, 0, get_saved_state_pc(state), instr);
+ 			DebuggerCall(EXC_BREAKPOINT, state);
+ 		}
+ 	}
+@@ -940,6 +944,8 @@
+ 			 * fatal exception, an explicit panic, or a stackshot
+ 			 * request.
+ 			 */
++			/* UMI: as above: the BRK the kernel took, its pc and its instruction (umi_cpu_pc.h). */
++			umi_cpu_pc_note_debugger(LX_DBG_KIND_BRK, 0, get_saved_state_pc(state), instr);
+ 			DebuggerCall(exception, state);
+ 
+ 			current_thread()->machine.kpcb = NULL;
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1072,6 +1072,40 @@
+ 	va_end(panic_str_args);
+ }
+ #endif /* defined (__x86_64__) */
++
++/*
++ * UMI: the return addresses above panic()'s caller, read from the frame chain before anything in
++ * this path can wait (version 6). Each step is read with ml_nofault_copy(), the check
++ * print_one_backtrace() makes: a frame pointer that is not 16-byte aligned, is outside the kernel's
++ * address space, or does not climb the stack ends the walk. Up to LX_PANIC_FPS of them.
++ */
++static unsigned int
++umi_panic_backtrace(uint64_t *pcs, unsigned int max)
++{
++	uint64_t fp = (uint64_t)(uintptr_t)__builtin_frame_address(0);
++	unsigned int n = 0;
++
++	while (n < max) {
++		uint64_t frame[2];
++
++		if ((fp & 0xfu) != 0 || fp < VM_MIN_KERNEL_ADDRESS ||
++		    fp > VM_MAX_KERNEL_ADDRESS - sizeof(frame)) {
++			break;
++		}
++		if (ml_nofault_copy((vm_offset_t)fp, (vm_offset_t)(uintptr_t)frame, sizeof(frame)) != sizeof(frame)) {
++			break;
++		}
++		if (frame[1] == 0) {
++			break;
++		}
++		pcs[n++] = frame[1];
++		if (frame[0] <= fp) {
++			break;          /* (the chain has to climb the stack; anything else is not one) */
++		}
++		fp = frame[0];
++	}
++	return n;
++}
+ 
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wmissing-noreturn"
+@@ -1080,6 +1114,32 @@
+     uint64_t panic_options_mask, void *panic_data_ptr, unsigned long panic_caller)
+ {
+ #pragma clang diagnostic pop
++
++	/*
++	 * UMI (version 6): the panic's own text, its caller and the return addresses above it, in the
++	 * breadcrumbs -- first of all, before the log line below (which takes the log's lock) and
++	 * before the debugger, which signals every other processor: plain stores to this processor's
++	 * own record, so the loader can print it from another core when this one never says another
++	 * word (work/v29i/INVESTIGATION-panic-xcall-hang.md §5.1). va_copy: the va_list is still
++	 * needed by the log and the debugger below.
++	 */
++	{
++		extern int vsnprintf(char *, size_t, const char *, va_list);
++		char msg[LX_PANIC_MSG];
++		uint64_t pcs[LX_PANIC_FPS];
++		va_list copy;
++		int written;
++
++		va_copy(copy, *panic_args);
++		written = vsnprintf(msg, sizeof(msg), panic_format_str, copy);
++		va_end(copy);
++		if (written < 0) {
++			written = 0;
++		}
++		umi_cpu_pc_note_panic((uint64_t)panic_caller, (uint32_t)written, msg);
++		umi_cpu_pc_note_panic_bt(pcs, umi_panic_backtrace(pcs, LX_PANIC_FPS));
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_ENTRY);
++	}
+ 
+ 	/*
+ 	 * UMI: every panic wrapper comes here, and the panic's text reaches the loader's live log
+@@ -1280,6 +1340,15 @@
+ 		if (debugger_panic_options & DEBUGGER_OPTION_PANICLOGANDREBOOT) {
+ 			panic_details |= kPanicDetailsForcePowerOff;
+ 		}
++		/*
++		 * UMI: the platform's panic actions (IOCPURunPlatformPanicActions(), reached through this
++		 * call) walk every registered IOKit service's method, with their locks and their devices --
++		 * exactly what a panic whose other processors are parked cannot be allowed to wait on.
++		 * They, and the same call from kPEPanicSync/kPEPanicDiagnosticsDone, are left out there
++		 * (IOPlatformActions.cpp asks umi_cpu_pc_panic_fast(); the panic header below is only
++		 * memory and is still initialised: work/v29i/INVESTIGATION-panic-xcall-hang.md §5.2-5).
++		 */
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_PANIC_BEGIN);
+ 		PEHaltRestartInternal(kPEPanicBegin, panic_details);
+ 
+ 		/*
+@@ -1330,13 +1399,18 @@
+ 	if (debugger_current_op == DBOP_PANIC || ((debugger_current_op == DBOP_DEBUGGER) && debugger_is_panic))
+ #endif /* __x86_64__ */
+ 	{
+-		kdp_callouts(KDP_EVENT_PANICLOG);
++		/* UMI: the KDP listeners again -- here they are the ones told the panic is being logged; a
++		 * panic on the fast path leaves them out, as it leaves out the entry callouts above. */
++		if (!umi_cpu_pc_panic_fast()) {
++			kdp_callouts(KDP_EVENT_PANICLOG);
++		}
+ 
+ 		/*
+ 		 * Write paniclog and panic stackshot (if supported)
+ 		 * TODO: Need to clear panic log when return from debugger
+ 		 * hooked up for embedded
+ 		 */
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_SAVEINFO);
+ 		SavePanicInfo(debugger_message, debugger_panic_data, debugger_panic_options);
+ 
+ #if DEVELOPMENT || DEBUG
+@@ -1431,6 +1505,9 @@
+ 
+ 	if (debugger_current_op == DBOP_PANIC ||
+ 	    ((debugger_current_op == DBOP_DEBUGGER) && debugger_is_panic)) {
++		/* UMI: the last stage of the diagnostics; the platform's panic actions behind this call
++		 * are the ones it leaves out (see IOPlatformActions.cpp). */
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_DIAG_DONE);
+ 		PEHaltRestart(kPEPanicDiagnosticsDone);
+ 	}
+ 
+@@ -1485,6 +1562,9 @@
+ #endif /* CONFIG_KDP_INTERACTIVE_DEBUGGING */
+ 
+ 	if (!panicDebugging) {
++		/* UMI: the last stage the kernel writes; loader_return() (and the way back to the boot
++		 * loader behind it) is next, and its own stages take over from here. */
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_REBOOT);
+ 		kdp_machine_reboot_type(kPEPanicRestartCPU, debugger_panic_options);
+ 	}
+ 
+@@ -1514,7 +1594,13 @@
+ 	DEBUGGER_TRAP_TIMESTAMP(0);
+ 
+ 	DebuggerLock();
++	/* UMI: the way out a panic takes, one stage at a time (umi_cpu_pc.h, version 6): the lock is
++	 * this processor's, and the next line signals every other one and waits for the answers. */
++	umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_LOCK);
+ 	ret = DebuggerHaltOtherCores(CPUDEBUGGERSYNC, (CPUDEBUGGEROP == DBOP_STACKSHOT));
++	/* (and they were signalled: DebuggerXCallEnter() has written how many answered, and which did
++	 * not, into the same record -- that is the bitmap this stage's line is read with) */
++	umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_HALTED);
+ 
+ 	DEBUGGER_TRAP_TIMESTAMP(1);
+ 
+@@ -1572,7 +1658,17 @@
+ 
+ 	DEBUGGER_TRAP_TIMESTAMP(2);
+ 
+-	kdp_callouts(KDP_EVENT_ENTER);
++	/*
++	 * UMI: a panic that has every other processor parked, or none of them to be had, does not run
++	 * the listeners registered for KDP's entry (they take their own locks and talk to their own
++	 * devices; one of them is the kdp_serial callout, which waits on a serial port this phone does
++	 * not have). The stage is set either way, so a report says whether this was the step that
++	 * stopped (work/v29i/INVESTIGATION-panic-xcall-hang.md §5.2-5).
++	 */
++	if (!umi_cpu_pc_panic_fast()) {
++		kdp_callouts(KDP_EVENT_ENTER);
++	}
++	umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_KDP_ENTER);
+ 	not_in_kdp = 0;
+ 
+ 	DEBUGGER_TRAP_TIMESTAMP(3);
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -664,6 +664,17 @@
+ 		panic_info->eph_panic_flags |= EMBEDDED_PANIC_HEADER_FLAG_STACKSHOT_FAILED_DEBUGGERSYNC;
+ 		panic_info->eph_other_log_offset = PE_get_offset_into_panic_region(debug_buf_ptr);
+ 		paniclog_append_noflush("!! debugger synchronization failed, no stackshot !!\n");
++	} else if (umi_cpu_pc_panic_fast()) {
++		/*
++		 * UMI (version 6): the cross-call reached every processor it signalled -- and that is
++		 * exactly when this stackshot is unsafe: it walks every task, thread, zone and coalition,
++		 * and any one of the parked processors may be holding one of the locks it needs (the v30
++		 * hotspot report has a processor stopped inside zalloc's zone checks). The paniclog above
++		 * and around this is memory only and is still written; the stackshot is not
++		 * (work/v29i/INVESTIGATION-panic-xcall-hang.md §4, row 7c, and §5.2-5).
++		 */
++		panic_info->eph_other_log_offset = PE_get_offset_into_panic_region(debug_buf_ptr);
++		paniclog_append_noflush("!! panic fast path: no stackshot !!\n");
+ 	} else if (stackshot_active()) {
+ 		panic_info->eph_panic_flags |= EMBEDDED_PANIC_HEADER_FLAG_STACKSHOT_FAILED_NESTED;
+ 		panic_info->eph_other_log_offset = PE_get_offset_into_panic_region(debug_buf_ptr);
+@@ -899,6 +910,30 @@
+ 	PESavePanicInfo((unsigned char *)gPanicBase, panicbuf_length);
+ 
+ 	PE_sync_panic_buffers();
++}
++
++/*
++ * UMI (version 6): a bit per other processor whose SIGPdebug is still pending -- one that has not
++ * answered this cross-call. Read here with interrupts off, from the processor that sent them, and
++ * written into the panic's record: it is the "which cores did not ack" half of the HALTED stage
++ * (umi_cpu_pc.h, work/v29i/INVESTIGATION-panic-xcall-hang.md §5.2). Nothing waits on it.
++ */
++static uint64_t
++umi_debugger_pending_mask(cpu_data_t *self, int max_cpu)
++{
++	uint64_t mask = 0;
++
++	for (int cpu = 0; cpu <= max_cpu && cpu < 64; cpu++) {
++		cpu_data_t *target_cpu_datap = (cpu_data_t *)CpuDataEntries[cpu].cpu_data_vaddr;
++
++		if (target_cpu_datap == NULL || target_cpu_datap == self) {
++			continue;
++		}
++		if (target_cpu_datap->cpu_signal & SIGPdebug) {
++			mask |= 1ULL << cpu;
++		}
++	}
++	return mask;
+ }
+ 
+ /*
+@@ -926,6 +961,7 @@
+ 	uint64_t max_mabs_time, current_mabs_time;
+ 	int cpu;
+ 	int max_cpu;
++	unsigned int signalled = 0;
+ 	cpu_data_t      *target_cpu_datap;
+ 	cpu_data_t      *cpu_data_ptr = getCpuDatap();
+ 
+@@ -978,6 +1014,7 @@
+ 			if (ret == KERN_SUCCESS) {
+ 				os_atomic_inc(&debugger_sync, relaxed);
+ 				os_atomic_inc(&debug_cpus_spinning, relaxed);
++				signalled++;
+ 			} else if (proceed_on_sync_failure) {
+ 				kprintf("cpu_signal failed in DebuggerXCallEnter\n");
+ 			}
+@@ -1090,12 +1127,21 @@
+ 				    os_atomic_load(&debug_ack_timeout, relaxed));
+ 			}
+ 			debug_ack_timeout_count++;
++			/* UMI (version 6): the cross-call did not reach every processor. Said in the panic's
++			 * record, so the loader's report and the panic path's own decisions
++			 * (umi_cpu_pc_panic_fast()) know the machine is not alone in here. */
++			umi_cpu_pc_note_panic_xcall((uint64_t)debugger_sync, signalled,
++			    umi_debugger_pending_mask(cpu_data_ptr, max_cpu), debug_ack_timeout_count);
+ 			return KERN_SUCCESS;
+ 		} else {
+ 			DebuggerXCallReturn();
+ 			return KERN_OPERATION_TIMED_OUT;
+ 		}
+ 	} else {
++		/* UMI (version 6): every processor this one signalled answered -- all of them are parked in
++		 * DebuggerXCall()'s wait now (the panic's record keeps the count and the bitmap). */
++		umi_cpu_pc_note_panic_xcall((uint64_t)debugger_sync, signalled, 0,
++		    debug_ack_timeout_count);
+ 		return KERN_SUCCESS;
+ 	}
+ }
+--- a/osfmk/arm/cpu_common.c
++++ b/osfmk/arm/cpu_common.c
+@@ -506,6 +506,21 @@
+ 	 */
+ 	__builtin_arm_dsb(DSB_ISHST);
+ 
++	/*
++	 * UMI: the target may have disabled its signals between the check above and the swap. The IPI
++	 * below is not sent then -- and this function used to say KERN_SUCCESS all the same, so the
++	 * debugger's cross-call counted a processor that had not been reached
++	 * (DebuggerXCallEnter()'s debugger_sync) and waited out its whole timeout for it. The signal
++	 * stays pending in the mask, as it does for the early return above, so the target runs it
++	 * when it enables its signals again; the answer is the same KERN_FAILURE the xcall branch
++	 * gives (work/v29i/INVESTIGATION-panic-xcall-hang.md §5.2-3).
++	 */
++	if ((Check_SIGPdisabled != 0) && (signal != SIGPxcall) && (signal != SIGPxcallImm) &&
++	    (target_proc->cpu_signal & SIGPdisabled)) {
++		ml_set_interrupts_enabled(interruptible);
++		return KERN_FAILURE;
++	}
++
+ 	if (!(target_proc->cpu_signal & SIGPdisabled)) {
+ 		if (defer) {
+ #if defined(HAS_IPI)
+--- a/osfmk/arm64/loader_return.c
++++ b/osfmk/arm64/loader_return.c
+@@ -447,21 +447,47 @@
+ 	 * on that processor only (on another one it has it call loader_return() in its turn).
+ 	 */
+ 	hakios_lx_quiesce_registers();  /* the Wi-Fi driver's bus shut before the others stop: no lock, no sleep */
++	/* UMI (version 6): the stages of the way out, for a panic that never says another word
++	 * (umi_cpu_pc.h): this one, then each driver below, then loader_jump(). */
++	umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_STOP_OTHERS);
+ 	psci_smp_stop_others();
+ 	loader_log_line("loader_return: the other processors are stopped (or this one is waiting to be)\n");
+ #endif
+-	hakios_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
+-	hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
+-	hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
+-	hakios_adsp_quiesce();         /* nor the audio DSP */
+-	hakios_mpss_quiesce();         /* nor the modem */
+-	hakios_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
+-	hakios_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
+-	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
+-	hakios_camera_quiesce();       /* the camera powered down, if it was powered up */
+-	hakios_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
+-	loader_log_line("loader_return: the drivers are quiet; the log is collected\n");
+-	/*
++	/*
++	 * UMI (version 6): a panic whose other processors are all parked in the debugger's cross-call,
++	 * or that could not reach them at all, does not touch the drivers or the memory controller on
++	 * the way out. Every quiesce below is an SMC/HVC to a DSP, a modem or the trust zone -- which
++	 * may be the very thing that is gone -- and hakios_ddr_quiesce() takes the memory's bandwidth
++	 * vote away while other processors may still be running: those are the two shapes of the last
++	 * two panics. The log is still collected and the way back is still taken
++	 * (work/v29i/INVESTIGATION-panic-xcall-hang.md §5.2-5).
++	 */
++	if (umi_cpu_pc_panic_fast()) {
++		loader_log_line("loader_return: the panic's fast path: the drivers and the memory are left as they are\n");
++	} else {
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_QUIESCE_UFS);
++		hakios_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_QUIESCE_ADRENO);
++		hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_QUIESCE_WIFI);
++		hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_QUIESCE_ADSP);
++		hakios_adsp_quiesce();         /* nor the audio DSP */
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_QUIESCE_MPSS);
++		hakios_mpss_quiesce();         /* nor the modem */
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_QUIESCE_DDR);
++		hakios_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_QUIESCE_HAPTIC);
++		hakios_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_QUIESCE_TORCH);
++		hakios_torch_quiesce();        /* the flashlight off, if it was lit */
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_QUIESCE_CAMERA);
++		hakios_camera_quiesce();       /* the camera powered down, if it was powered up */
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_QUIESCE_MIC);
++		hakios_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
++		loader_log_line("loader_return: the drivers are quiet; the log is collected\n");
++	}
++	/*
+ 	 * A panic's text is first collected in the panic buffer and only later
+ 	 * flushed to the console; if the console itself is what failed, that
+ 	 * never happens. Append the buffer so the loader gets it either way.
+@@ -478,6 +504,7 @@
+ 		}
+ 	}
+ 	umi_prod_finish();
++	umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_JUMP);
+ 	loader_jump(0, 0);
+ }
+ 
+--- a/osfmk/arm64/psci_smp.c
++++ b/osfmk/arm64/psci_smp.c
+@@ -37,6 +37,7 @@
+ #include <kern/misc_protos.h>
+ #include <libkern/kernel_mach_header.h>
+ #include <machine/atomic.h>
++#include <arm64/umi_cpu_pc.h>
+ #include <arm/caches_internal.h>
+ #include <arm/cpu_data_internal.h>
+ #include <arm/cpu_internal.h>
+@@ -240,6 +241,9 @@
+ 	os_atomic_store(&psci_smp_cpu_stage[cpu_number()], PSCI_SMP_CPU_OFF, release);
+ 	__builtin_arm_dsb(DSB_SY);
+ 
++	/* UMI (version 6): the firmware is asked to switch this processor off and does not have to
++	 * answer -- a report that stops here says so (umi_cpu_pc.h). */
++	umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_PSCI_CPU_OFF);
+ 	(void) psci_call(PSCI_CPU_OFF, 0, 0, 0);
+ 	for (;;) {
+ 		__builtin_arm_wfi();    /* the firmware refused: stay out of the way all the same */
+@@ -268,6 +272,7 @@
+ 
+ 	os_atomic_store(&psci_smp_stopping, true, release);
+ 	__builtin_arm_dsb(DSB_SY);
++	umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_PSCI_STOP_REST);
+ 	for (int cpu = 0; cpu <= max_cpu; cpu++) {
+ 		cpu_data_t *cdp = cpu_datap(cpu);
+ 
+@@ -307,6 +312,7 @@
+ 		 * off while it holds a lock the boot processor is waiting for would take the return
+ 		 * with it.
+ 		 */
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_PSCI_BOOT_WANTED);
+ 		psci_smp_note(" ends the system: the return to the boot loader is the boot processor's to make\n", me);
+ 		os_atomic_store(&psci_smp_boot_wanted, true, release);
+ 		__builtin_arm_dsb(DSB_SY);
+@@ -315,6 +321,7 @@
+ 		now = mach_absolute_time();
+ 		nanoseconds_to_absolutetime(PSCI_SMP_STOP_SECONDS * NSEC_PER_SEC, &deadline);
+ 		deadline += now;
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_PSCI_MASTER_WAIT);
+ 		while (!os_atomic_load(&psci_smp_stopping, acquire) && now < deadline) {
+ 			now = mach_absolute_time();
+ 		}
+@@ -340,9 +347,11 @@
+ 		if (cpu == me || cdp == NULL || !(psci_smp_started & (1u << cpu))) {
+ 			continue;
+ 		}
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_PSCI_WAIT_CPU);
+ 		while (now < deadline) {
+ 			if (os_atomic_load(&psci_smp_cpu_stage[cpu], acquire) == PSCI_SMP_CPU_OFF) {
+ 				/* it has said it is going; the firmware knows when it has gone (if it can tell at all) */
++				umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_PSCI_AFFINITY);
+ 				int64_t state = psci_call(PSCI_AFFINITY_INFO, cdp->cpu_phys_id, 0, 0);
+ 
+ 				if (state == PSCI_AFFINITY_OFF || state < 0) {
+@@ -351,6 +360,7 @@
+ 			}
+ 			now = mach_absolute_time();
+ 		}
++		umi_cpu_pc_note_panic_stage(LX_PANIC_STAGE_PSCI_AFFINITY);
+ 		if (os_atomic_load(&psci_smp_cpu_stage[cpu], acquire) != PSCI_SMP_CPU_OFF &&
+ 		    psci_call(PSCI_AFFINITY_INFO, cdp->cpu_phys_id, 0, 0) != PSCI_AFFINITY_OFF) {
+ 			psci_smp_note(" did not stop: it is left running\n", cpu);
+--- a/iokit/Kernel/IOPlatformActions.cpp
++++ b/iokit/Kernel/IOPlatformActions.cpp
+@@ -39,6 +39,11 @@
+ #include <IOKit/IOPlatformActions.h>
+ #include "IOKitKernelInternal.h"
+ 
++/* UMI: whether this machine's panic may skip the platform's panic actions (osfmk/arm64/
++ * umi_cpu_pc.h and .inc; the panic's own record says whether the debugger's cross-call was run
++ * and how it ended). */
++extern "C" boolean_t umi_cpu_pc_panic_fast(void);
++
+ static IOLock *gIOPlatformActionsLock;
+ 
+ typedef kern_return_t (*iocpu_platform_action_t)(void * refcon0, void * refcon1, uint32_t priority,
+@@ -164,6 +169,17 @@
+ extern "C" kern_return_t
+ IOCPURunPlatformPanicActions(uint32_t message, uint32_t details)
+ {
++	/*
++	 * UMI: a panic whose other processors are parked in the debugger (or that could not reach
++	 * them at all) runs none of the registered panic actions. Each is an IOKit service's own
++	 * method -- any lock, any device -- and the processors it would wait on are the ones this
++	 * panic stopped; the last two panics on this port died in exactly this kind of wait. The
++	 * panic's own record is in memory and needs none of it (osfmk/arm64/umi_cpu_pc.h,
++	 * umi_cpu_pc_panic_fast(); work/v29i/INVESTIGATION-panic-xcall-hang.md §5.2-5).
++	 */
++	if (umi_cpu_pc_panic_fast()) {
++		return kIOReturnNotReady;
++	}
+ 	// Don't allow nested calls of panic actions
+ 	if (!gActionQueues[kQueuePanic].next) {
+ 		return kIOReturnNotReady;
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1259,6 +1259,20 @@
+ static void
+ kdp_machine_reboot_type(unsigned int type, uint64_t debugger_flags)
+ {
++	/*
++	 * UMI (v34, stage PARKED): a panic whose other processors are parked in the debugger's
++	 * cross-call, or that could not reach them at all, does not take the way back to the boot
++	 * loader. That way -- psci_smp_stop_others(), the quiesces, loader_jump() -- is what ended
++	 * the panics before this one in a machine reset with no report at all (IMPL-panic-record-v6,
++	 * "v34"). This processor says so in the record, masks its interrupts and stops; the loader,
++	 * watching from its own processor, reports the kernel as hung and prints the record's lines.
++	 * The paniclog is already in memory (SavePanicInfo() flushed it) and every step that could
++	 * wait on another processor or on the firmware has already been left out above. A normal
++	 * reboot or shutdown has no panic record, so it still takes loader_return() as it did.
++	 */
++	if (umi_cpu_pc_panic_fast()) {
++		umi_cpu_pc_panic_park();
++	}
+ 	loader_return();
+ 	if ((type == kPEPanicRestartCPU) && (debugger_flags & DEBUGGER_OPTION_SKIP_PANICEND_CALLOUTS)) {
+ 		PEHaltRestart(kPEPanicRestartCPUNoCallouts);
+--- a/osfmk/arm64/loader_return.c
++++ b/osfmk/arm64/loader_return.c
+@@ -689,6 +689,16 @@
+ 		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
+ 	}
+-	if (++loader_live.heartbeat % MEMORY_REPORT_BEATS == 0) {
++	/*
++	 * UMI (v34): a panic has been written into the breadcrumbs, and this kernel will say nothing
++	 * more. The loader calls a kernel hung after 50 s without a new heartbeat, and reports at once
++	 * when the panic's own record is in the table (loader.c); this stops the number it watches
++	 * from ever going up again, even if a processor the panic could not stop still runs this
++	 * timer -- the ordinary 50 s silence is then the backstop, not the only way to be seen. The
++	 * hypervisor's own watchdog is still fed above; only the sign of life to the loader stops.
++	 */
++	if (umi_cpu_pc_panicked()) {
++		/* (the panic's record is what says so; the next beat is left to the loader's report) */
++	} else if (++loader_live.heartbeat % MEMORY_REPORT_BEATS == 0) {
+ 		memory_report();
+ 	}
+ 
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1245,6 +1245,12 @@
+ {
+ 	/* UMI: the last line of a panic that does get this far, before the way back to the loader. */
+ 	loader_log_line("panic: panic_stop() reached; the way back to the loader begins\n");
++	/* UMI (v34): a panic on the fast path does not take the way back to the loader; it parks
++	 * here and the loader reports it (see kdp_machine_reboot_type()). The nested-panic bailouts
++	 * and the debugger's own stop reach this spin directly, after the same record is written. */
++	if (umi_cpu_pc_panic_fast()) {
++		umi_cpu_pc_panic_park();
++	}
+ 	loader_return();
+ 	for (;;) {
+ #if defined(__arm__) || defined(__arm64__)
