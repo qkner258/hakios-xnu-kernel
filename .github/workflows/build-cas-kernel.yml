@@ -23,6 +23,37 @@ jobs:
           mkdir -p devices
           cp -a /tmp/umi/devices/xiaomi-mi-10 devices/
           ls devices/xiaomi-mi-10 | head -5
+      # 借用 UniXNU-cas 的 ci/xnu/toolchain.json 思路：每轮构建把"编的是哪棵树、什么身份"钉死，
+      # 随 artifact 一起出来。我们此前踩过"这轮编的是哪棵树"的坑，这一份就是答案。
+      - name: toolchain identity
+        run: |
+          mkdir -p out
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          def sh(*a):
+              try:
+                  return subprocess.run(a, capture_output=True, text=True).stdout.strip()
+              except Exception:
+                  return ""
+          doc = {
+              "runner": "ubuntu-24.04",
+              "xnu_source": "apple-oss-distributions/xnu xnu-8796.121.2",
+              "darwin": "22.5.0",
+              "target_system": {"version": "16.5", "build": "20F66"},
+              "kernel_config": "DEVELOPMENT_ARM64_BCM2837",
+              "page_size": 4096,
+              "framework": sh("git", "rev-parse", "HEAD"),
+              "device_layer": sh("git", "-C", "/tmp/umi", "rev-parse", "HEAD"),
+              "device_layer_subject": sh("git", "-C", "/tmp/umi", "log", "-1", "--pretty=%s"),
+              "clang": (sh("clang", "--version").splitlines() or [""])[0],
+          }
+          sdk = pathlib.Path(os.environ.get("HOME", "")) / "theos/sdks"
+          doc["theos_sdks"] = sorted(p.name for p in sdk.glob("*.sdk")) if sdk.is_dir() else []
+          out = pathlib.Path("out/toolchain.json")
+          out.write_text(json.dumps(doc, indent=2) + "\n")
+          print(out.read_text())
+          PY
+
       - name: theos
         continue-on-error: true
         run: |
@@ -102,6 +133,12 @@ jobs:
         with:
           name: build-log
           path: /tmp/build.log
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: toolchain-identity
+          path: out/toolchain.json
           if-no-files-found: warn
       - uses: actions/upload-artifact@v4
         with:
