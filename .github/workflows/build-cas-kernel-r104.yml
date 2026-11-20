@@ -1,0 +1,169 @@
+name: build-cas-kernel
+on:
+  workflow_dispatch:
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      XNU_SRC: ${{ github.workspace }}/out/xiaomi-mi-10/xnu
+      KERNEL: ${{ github.workspace }}/out/xiaomi-mi-10/xnu/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential clang lld llvm libssl-dev uuid-dev flex bison m4 perl python3 autoconf automake libtool pkg-config
+      # The device layer is not committed here: it is the upstream UMI tree, pinned by its HEAD.
+      - name: umi device layer
+        run: |
+          git clone --depth 1 https://github.com/xm6661885/hakios-xnu-kernel-umi-fixes /tmp/umi
+          git -C /tmp/umi log --oneline -1
+          rm -rf devices/xiaomi-mi-10
+          mkdir -p devices
+          cp -a /tmp/umi/devices/xiaomi-mi-10 devices/
+          ls devices/xiaomi-mi-10 | head -5
+      - name: toolchain identity
+        run: |
+          mkdir -p out
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          def sh(*a):
+              try:
+                  return subprocess.run(a, capture_output=True, text=True).stdout.strip()
+              except Exception:
+                  return ""
+          doc = {
+              "runner": "ubuntu-24.04",
+              "xnu_source": "apple-oss-distributions/xnu xnu-8796.121.2",
+              "darwin": "22.5.0",
+              "target_system": {"version": "16.5", "build": "20F66"},
+              "kernel_config": "DEVELOPMENT_ARM64_BCM2837",
+              "page_size": 4096,
+              "framework": sh("git", "rev-parse", "HEAD"),
+              "device_layer": sh("git", "-C", "/tmp/umi", "rev-parse", "HEAD"),
+              "clang": (sh("clang", "--version").splitlines() or [""])[0],
+          }
+          out = pathlib.Path("out/toolchain.json")
+          out.write_text(json.dumps(doc, indent=2) + "\n")
+          print(out.read_text())
+          PY
+
+      - name: theos
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/theos/theos "$HOME/theos"
+          cd "$HOME/theos"
+          ok=0
+          for i in 1 2 3; do
+            if yes | bash bin/install-theos; then ok=1; break; fi
+            sleep 30
+          done
+          [ "$ok" = 1 ] || echo "::warning::theos install did not finish (SDK optional)"
+      # devices/xiaomi-mi-10/build-kernel.sh is the authority for the order that follows;
+      # these steps reproduce it, with the diagnostic patches this kernel needs added in place.
+      - name: xnu-source + device overlay
+        run: |
+          python3 devices/xiaomi-mi-10/prepare.py kernel
+          grep -c . "$XNU_SRC/bsd/dev/hakios.adreno.c" || true
+      # bsd/dev/umi_bluetooth.c includes umi_bt_firmware.inc; build-kernel.sh makes it from the
+      # git-ignored QCA6390 firmware. The script writes an empty array when the firmware is absent.
+      # The build directory is made here too, as mk-wlfw.sh requires it to exist.
+      - name: bluetooth firmware include + build dir
+        run: |
+          python3 devices/xiaomi-mi-10/tools/embed-firmware.py \
+            --patch fw-bluetooth/htbtfw20.tlv --nvm fw-bluetooth/htnv20.bin \
+            --output "$XNU_SRC/bsd/dev/umi_bt_firmware.inc"
+          wc -c "$XNU_SRC/bsd/dev/umi_bt_firmware.inc"
+          mkdir -p "$XNU_SRC/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT"
+      # Apple's pid 1 candidate list is /sbin/launchd only; our root's init is /sbin/init.
+      - name: pid 1 accepts /sbin/init
+        run: |
+          python3 - "$XNU_SRC/bsd/kern/kern_exec.c" <<'PY'
+          import sys, pathlib
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          if '"/sbin/init"' in s:
+              print('pid1: /sbin/init already listed')
+              raise SystemExit
+          anchor = '\t"/sbin/launchd",\n};\n'
+          if anchor not in s:
+              raise SystemExit('pid1: init candidate list is not where it was; refusing to guess')
+          p.write_text(s.replace(anchor, '\t"/sbin/launchd",\n\t"/sbin/init",\n};\n', 1))
+          print('pid1: /sbin/init added')
+          PY
+      - name: apfs mount trace
+        continue-on-error: true
+        run: |
+          set +e
+          echo 'aW1wb3J0IHN5cywgcGF0aGxpYgpwID0gcGF0aGxpYi5QYXRoKHN5cy5hcmd2WzFdKTsgcyA9IHAucmVhZF90ZXh0KCkKaWYgJ2FwZnMtdHJhY2UnIGluIHM6CiAgICBwcmludCgnYXBmcy10cmFjZTogYWxyZWFkeSBpbnNlcnRlZCcpOyByYWlzZSBTeXN0ZW1FeGl0CnJlcHMgPSBbCiAoJ1x0aWYgKGVycm9yID09IDApIHtcblx0XHRlcnJvciA9IHZub2RlX2xvb2t1cChwYXRoLCAwLCAmdnAsIGN0eCk7XG5cdH1cbicsCiAgJ1x0aWYgKGVycm9yID09IDApIHtcblx0XHRlcnJvciA9IHZub2RlX2xvb2t1cChwYXRoLCAwLCAmdnAsIGN0eCk7XG5cdH1cbicKICAnXHRwcmludGYoImFwZnMtdHJhY2U6ICVzOiBsb29rdXAgJWQgdnAgJXAgYmxrICVkXFxuIiwgcGF0aCwgZXJyb3IsICh2b2lkICopdnAsIHZwICE9IE5VTExWUCA/IHZub2RlX2lzYmxrKHZwKSA6IC0xKTtcbicpLAogKCdcdFx0ZXJyb3IgPSBWTk9QX09QRU4odnAsIEZSRUFELCBjdHgpO1xuJywKICAnXHRcdGVycm9yID0gVk5PUF9PUEVOKHZwLCBGUkVBRCwgY3R4KTtcbicKICAnXHRcdHByaW50ZigiYXBmcy10cmFjZTogb3BlbiAlczogJWRcXG4iLCBwYXRoLCBlcnJvcik7XG4nKSwKICgnXHRcdFx0ZXJyb3IgPSBhcGZzX21vdW50X2NvbW1vbihtcCwgdnAsIGN0eCwgY29udGFpbmVyLCB2b2x1bWUpO1xuJywKICAnXHRcdFx0ZXJyb3IgPSBhcGZzX21vdW50X2NvbW1vbihtcCwgdnAsIGN0eCwgY29udGFpbmVyLCB2b2x1bWUpO1xuJwogICdcdFx0XHRwcmludGYoImFwZnMtdHJhY2U6IG1vdW50X2NvbW1vbiAlczogJWRcXG4iLCBwYXRoLCBlcnJvcik7XG4nKSwKICgnXHRpZiAoVk5PUF9JT0NUTChkZXZ2cCwgREtJT0NHRVRCTE9DS1NJWkUsIChjYWRkcl90KSZkZXZibG9jaywgMCwgY3R4KSAhPSAwIHx8XG4nLAogICdcdHsgdWludDMyX3QgX2IgPSAwOyBpbnQgX2UgPSBWTk9QX0lPQ1RMKGRldnZwLCBES0lPQ0dFVEJMT0NLU0laRSwgKGNhZGRyX3QpJl9iLCAwLCBjdHgpO1xuJwogICdcdCAgcHJpbnRmKCJhcGZzLXRyYWNlOiBkZXZibG9jayAldSBpb2N0bC1lcnIgJWQgY2h1bmsgJXVcXG4iLCBfYiwgX2UsICh1bnNpZ25lZClBUEZTX01FVEFfQ0hVTkspOyB9XG4nCiAgJ1x0aWYgKFZOT1BfSU9DVEwoZGV2dnAsIERLSU9DR0VUQkxPQ0tTSVpFLCAoY2FkZHJfdCkmZGV2YmxvY2ssIDAsIGN0eCkgIT0gMCB8fFxuJyksCiAoJ1x0XHRcdGVycm9yID0gYXBmc19kZXZfcmVhZChkYywgMCwgc2IsIEFQRlNfTUVUQV9DSFVOSyk7XG4nLAogICdcdFx0XHRlcnJvciA9IGFwZnNfZGV2X3JlYWQoZGMsIDAsIHNiLCBBUEZTX01FVEFfQ0hVTkspO1xuJwogICdcdFx0XHRwcmludGYoImFwZnMtdHJhY2U6IHJlYWQwIGVyciAlZCBtYWdpYyAlMDJ4JTAyeCUwMnglMDJ4IGF0MzJcXG4iLCBlcnJvcixcbicKICAnXHRcdFx0ICAgIGVycm9yID09IDAgPyBzYlszMl0gOiAwLCBlcnJvciA9PSAwID8gc2JbMzNdIDogMCwgZXJyb3IgPT0gMCA/IHNiWzM0XSA6IDAsIGVycm9yID09IDAgPyBzYlszNV0gOiAwKTtcbicpLAogKCdcdFx0XHRpZiAoZXJyb3IgPT0gMCAmJiBtZW1jbXAoc2IgKyAzMiwgIk5YU0IiLCA0KSAhPSAwKSB7XG4nLAogICdcdFx0XHRpZiAoZXJyb3IgPT0gMCAmJiBtZW1jbXAoc2IgKyAzMiwgIk5YU0IiLCA0KSAhPSAwKSB7XG4nCiAgJ1x0XHRcdFx0cHJpbnRmKCJhcGZzLXRyYWNlOiBOWFNCIG1pc3NpbmcsIHRoaXMgaXMgbm90IGEgY29udGFpbmVyXFxuIik7XG4nKSwKXQpmb3Igb2xkLCBuZXcgaW4gcmVwczoKICAgIGlmIG9sZCBub3QgaW4gczoKICAgICAgICByYWlzZSBTeXN0ZW1FeGl0KCdhcGZzLXRyYWNlOiBhbmNob3IgbWlzc2luZzogJyArIHJlcHIob2xkWzo0MF0pKQogICAgcyA9IHMucmVwbGFjZShvbGQsIG5ldywgMSkKcC53cml0ZV90ZXh0KHMpCnByaW50KCdhcGZzLXRyYWNlOiBpbnNlcnRlZCA2IHByb2JlcycpCg==' | base64 -d > /tmp/apfs_trace.py
+          echo "apfs target: $(ls -l "$XNU_SRC/bsd/miscfs/apfs/apfs_vfsops.c" 2>&1)"
+          head -c 60 /tmp/apfs_trace.py; echo
+          python3 /tmp/apfs_trace.py "$XNU_SRC/bsd/miscfs/apfs/apfs_vfsops.c"; echo "apfs patch exit: $?"
+
+      - name: display bootlog handover
+        continue-on-error: true
+        run: |
+          set +e
+          echo 'aW1wb3J0IHN5cywgcGF0aGxpYgpwID0gcGF0aGxpYi5QYXRoKHN5cy5hcmd2WzFdKTsgcyA9IHAucmVhZF90ZXh0KCkKaWYgJ2ZiZ3JhcGhpY3M6JyBpbiBzOgogICAgcHJpbnQoJ2ZiZ3JhcGhpY3M6IGFscmVhZHkgaW5zZXJ0ZWQnKTsgcmFpc2UgU3lzdGVtRXhpdApvbGQgPSAnSU9Nb2JpbGVGcmFtZWJ1ZmZlcjo6c2hvdyhjb25zdCB1aW50OF90ICogc3dhcCwgTWluaUlPU3VyZmFjZSAqKiBzdXJmYWNlcylcbntcbicKaWYgb2xkIG5vdCBpbiBzOgogICAgcmFpc2UgU3lzdGVtRXhpdCgnZmJncmFwaGljczogYW5jaG9yIG1pc3NpbmcnKQpuZXcgPSBvbGQgKyAoCiAnXHQvKiBmR3JhcGhpY3MgaXMgbmV2ZXIgaW5pdGlhbGlzZWQgaW4gdGhpcyBjbGFzcywgc28ga2VlcCBvdXIgb3duIG9uZS1zaG90IGZsYWc6ICovXG4nCiAnXHQvKiB0aGUgZmlyc3Qgc3dhcCBvZiBhIHJ1biBpcyB0aGUgVUkgYW5kIHRoZSBib290IGxvZyBzdG9wcyBkcmF3aW5nIGZvciBnb29kLiAqL1xuJwogJ1x0c3RhdGljIGJvb2wgc0ZCSGFuZG92ZXJEb25lID0gZmFsc2U7XG4nCiAnXHRpZiAoIXNGQkhhbmRvdmVyRG9uZSkge1xuJwogJ1x0XHRzRkJIYW5kb3ZlckRvbmUgPSB0cnVlO1xuJwogJ1x0XHRmR3JhcGhpY3MgPSB0cnVlO1xuJwogJ1x0XHRoYWtpb3NfdGwoImZiZ3JhcGhpY3M6IGhhbmRvdmVyIGF0IHNob3coKSBlbnRyeSwgc3dhcCAldVxcbiIsIHN3YXBXb3JkKHN3YXAsIFNXQVBfSUQpKTtcbicKICdcdFx0UEVfaW5pdGlhbGl6ZV9jb25zb2xlKE5VTEwsIGtQRUdyYXBoaWNzTW9kZSk7XG4nCiAnXHRcdGhha2lvc19ib290bG9nX3N0b3AoMCk7XG4nCiAnXHR9XG4nKQpwLndyaXRlX3RleHQocy5yZXBsYWNlKG9sZCwgbmV3LCAxKSkKcHJpbnQoJ2ZiZ3JhcGhpY3M6IGhhbmRvdmVyIGluc2VydGVkIGF0IHNob3coKSBlbnRyeScpCg==' | base64 -d > /tmp/bootlog_handover.py
+          echo "fb target: $(ls -l "$XNU_SRC/iokit/Kernel/MiniIOMobileFramebuffer.cpp" 2>&1)"
+          python3 /tmp/bootlog_handover.py "$XNU_SRC/iokit/Kernel/MiniIOMobileFramebuffer.cpp"; echo "fb patch exit: $?"
+
+      - name: console goes quiet after handover
+        continue-on-error: true
+        run: |
+          set +e
+          echo 'aW1wb3J0IHN5cywgcGF0aGxpYgpwID0gcGF0aGxpYi5QYXRoKHN5cy5hcmd2WzFdKTsgcyA9IHAucmVhZF90ZXh0KCkKaWYgJ2hha2lvc19ib290bG9nX2lzX3N0b3BwZWQnIGluIHM6CiAgICBwcmludCgnYm9vdGxvZyBleHBvcnQ6IGFscmVhZHknKTsgcmFpc2UgU3lzdGVtRXhpdApvbGQgPSAndm9pZFxuaGFraW9zX2Jvb3Rsb2dfcGFuaWModm9pZClcbntcbicKaWYgb2xkIG5vdCBpbiBzOgogICAgcmFpc2UgU3lzdGVtRXhpdCgnYm9vdGxvZyBleHBvcnQ6IGFuY2hvciBtaXNzaW5nJykKbmV3ID0gKCcvKiBSZWFkIGJ5IHRoZSBjb25zb2xlIHBhdGg6IG9uY2UgdGhlIFVJIG93bnMgdGhlIHBhbmVsIG5vdGhpbmcgbW9yZSBpcyBwcmludGVkIG92ZXIgaXQuICovXG4nCiAgICAgICAnaW50XG5oYWtpb3NfYm9vdGxvZ19pc19zdG9wcGVkKHZvaWQpXG57XG4nCiAgICAgICAnXHRyZXR1cm4gb3NfYXRvbWljX2xvYWQoJmJvb3Rsb2dfc3RvcHBlZCwgYWNxdWlyZSkgIT0gMDtcbn1cblxuJyArIG9sZCkKcC53cml0ZV90ZXh0KHMucmVwbGFjZShvbGQsIG5ldywgMSkpCnByaW50KCdib290bG9nIGV4cG9ydDogYWRkZWQnKQo=' | base64 -d > /tmp/bootlog_export.py
+          echo 'aW1wb3J0IHN5cywgcGF0aGxpYgpwID0gcGF0aGxpYi5QYXRoKHN5cy5hcmd2WzFdKTsgcyA9IHAucmVhZF90ZXh0KCkKaWYgJ2hha2lvc19ib290bG9nX2lzX3N0b3BwZWQnIGluIHM6CiAgICBwcmludCgnY29uc29sZSBxdWlldDogYWxyZWFkeScpOyByYWlzZSBTeXN0ZW1FeGl0Cm9sZCA9ICdcdGFzc2VydChzdHIgIT0gTlVMTCk7XG4nCmlmIG9sZCBub3QgaW4gczoKICAgIHJhaXNlIFN5c3RlbUV4aXQoJ2NvbnNvbGUgcXVpZXQ6IGFuY2hvciBtaXNzaW5nJykKbmV3ID0gKCdcdGFzc2VydChzdHIgIT0gTlVMTCk7XG4nCiAgICAgICAnXHR7IGV4dGVybiBpbnQgaGFraW9zX2Jvb3Rsb2dfaXNfc3RvcHBlZCh2b2lkKTtcbicKICAgICAgICdcdCAgaWYgKGhha2lvc19ib290bG9nX2lzX3N0b3BwZWQoKSkgeyByZXR1cm47IH0gfVxuJykKcC53cml0ZV90ZXh0KHMucmVwbGFjZShvbGQsIG5ldywgMSkpCnByaW50KCdjb25zb2xlIHF1aWV0OiBhZGRlZCcpCg==' | base64 -d > /tmp/console_quiet.py
+          python3 /tmp/bootlog_export.py "$XNU_SRC/bsd/dev/umi_bootlog.c"; echo "bootlog export exit: $?"
+          echo "serial: $(ls -l "$XNU_SRC/osfmk/console/serial_console.c" 2>&1)"
+          python3 /tmp/console_quiet.py "$XNU_SRC/osfmk/console/serial_console.c"; echo "console quiet exit: $?"
+
+      - name: deps-xnu
+        run: |
+          export THEOS="$HOME/theos"
+          xnu-deps/setup.sh
+      - name: build
+        run: |
+          export THEOS="$HOME/theos"
+          export XNU_SRC="$PWD/out/xiaomi-mi-10/xnu"
+          export KERNEL="$XNU_SRC/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837"
+          ulimit -s unlimited
+          set +e
+          [ ! -f xnu-deps/build/ath11k/src/ath11k/qmi.c ] || tools/mk-wlfw.sh
+          ./xnu-build.sh -k -j4 > /tmp/build.log 2>&1
+          echo "xnu-build exit: $?"
+          echo "---- first errors ----"
+          grep -nE "error:|fatal error|No such file|cannot find|undefined reference" /tmp/build.log | head -40
+          echo "---- tail ----"
+          tail -40 /tmp/build.log
+          KERNEL="$KERNEL" tools/make-kernel.sh --judge /tmp/build.log
+      - name: collect
+        if: always()
+        run: |
+          mkdir -p out
+          K=$(find out/xiaomi-mi-10 -name 'mach.*unstripped' 2>/dev/null | head -1) || true
+          [ -n "$K" ] || K=$(find out/xiaomi-mi-10 -name 'mach.development.bcm2837' 2>/dev/null | head -1) || true
+          if [ -n "$K" ]; then
+            llvm-strip-18 -S -o out/hakios-kernel "$K" || cp "$K" out/hakios-kernel
+            ls -lh out/hakios-kernel
+          else
+            echo "::error::no kernel produced; see build.log in the artifacts"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: /tmp/build.log
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: toolchain-identity
+          path: out/toolchain.json
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cas-kernel
+          path: out/hakios-kernel
+          if-no-files-found: warn
