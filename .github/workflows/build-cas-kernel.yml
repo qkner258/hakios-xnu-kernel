@@ -97,6 +97,36 @@ jobs:
           p.write_text(s.replace(anchor, '\t"/sbin/launchd",\n\t"/sbin/init",\n};\n', 1))
           print('pid1: /sbin/init added')
           PY
+      # apfs 挂载在 umi 树上返回 EINVAL（r92/r93 已排除设备名与 GPU）。这三条探针用来分流：
+      # 一条都不出现 => 请求在 VFS 层就被拒（fstype 没注册），根本没进 apfs_mount；
+      # 出现了 => 看哪一条的返回值是 22，就知道是 lookup、open 还是卷校验拒绝的。
+      - name: apfs mount trace
+        run: |
+          python3 - "$XNU_SRC/bsd/miscfs/apfs/apfs_vfsops.c" <<'PY'
+          import sys, pathlib
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          if 'apfs-trace' in s:
+              print('apfs-trace: already inserted')
+              raise SystemExit
+          reps = [
+              ('\tif (error == 0) {\n\t\terror = vnode_lookup(path, 0, &vp, ctx);\n\t}\n',
+               '\tif (error == 0) {\n\t\terror = vnode_lookup(path, 0, &vp, ctx);\n\t}\n'
+               '\tprintf("apfs-trace: %s: lookup %d vp %p blk %d\\n", path, error, (void *)vp, vp != NULLVP ? vnode_isblk(vp) : -1);\n'),
+              ('\t\terror = VNOP_OPEN(vp, FREAD, ctx);\n',
+               '\t\t\terror = VNOP_OPEN(vp, FREAD, ctx);\n'
+               '\t\tprintf("apfs-trace: open %s: %d\\n", path, error);\n'),
+              ('\t\t\terror = apfs_mount_common(mp, vp, ctx, container, volume);\n',
+               '\t\t\terror = apfs_mount_common(mp, vp, ctx, container, volume);\n'
+               '\t\t\tprintf("apfs-trace: mount_common %s: %d\\n", path, error);\n'),
+          ]
+          for old, new in reps:
+              if old not in s:
+                  raise SystemExit('apfs-trace: anchor missing: ' + repr(old[:40]))
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+          print('apfs-trace: inserted 3 probes')
+          PY
       - name: deps-xnu
         run: |
           export THEOS="$HOME/theos"
