@@ -43,6 +43,18 @@ jobs:
           python3 devices/xiaomi-mi-10/prepare.py kernel
           ls -la "$XNU_SRC" | head
           grep -c . "$XNU_SRC/bsd/dev/hakios.adreno.c" || true
+      # bsd/dev/umi_bluetooth.c includes umi_bt_firmware.inc, which build-kernel.sh normally makes
+      # with tools/embed-firmware.py from the local (git-ignored) QCA6390 firmware. Without the step
+      # the bluetooth object fails to compile and the whole kernel build stops. The script emits an
+      # empty array when the firmware files are absent, which is what CI has.
+      - name: bluetooth firmware include
+        run: |
+          python3 devices/xiaomi-mi-10/tools/embed-firmware.py \
+            --patch fw-bluetooth/htbtfw20.tlv \
+            --nvm fw-bluetooth/htnv20.bin \
+            --output "$XNU_SRC/bsd/dev/umi_bt_firmware.inc"
+          wc -c "$XNU_SRC/bsd/dev/umi_bt_firmware.inc"
+
       # pid 1's candidate list in Apple's tree is /sbin/launchd only; our root has /sbin/init.
       # Without this the kernel panics with /sbin/launchd ENOENT before anything runs.
       - name: pid 1 accepts /sbin/init
