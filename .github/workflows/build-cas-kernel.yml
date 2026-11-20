@@ -14,6 +14,16 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential clang lld llvm libssl-dev uuid-dev flex bison m4 perl python3 autoconf automake libtool pkg-config
+      # 设备层不用上传：直接从公开仓库拉我们验证过的那份。
+      - name: umi device layer
+        run: |
+          git clone --depth 1 https://github.com/xm6661885/hakios-xnu-kernel-umi-fixes /tmp/umi
+          git -C /tmp/umi log --oneline -1
+          rm -rf devices/xiaomi-mi-10
+          mkdir -p devices
+          cp -a /tmp/umi/devices/xiaomi-mi-10 devices/
+          ls devices/xiaomi-mi-10 | head -5
+
       - name: theos
         continue-on-error: true
         run: |
@@ -33,6 +43,23 @@ jobs:
           python3 devices/xiaomi-mi-10/prepare.py kernel
           ls -la "$XNU_SRC" | head
           grep -c . "$XNU_SRC/bsd/dev/hakios.adreno.c" || true
+      # pid 1's candidate list in Apple's tree is /sbin/launchd only; our root has /sbin/init.
+      # Without this the kernel panics with /sbin/launchd ENOENT before anything runs.
+      - name: pid 1 accepts /sbin/init
+        run: |
+          python3 - "$XNU_SRC/bsd/kern/kern_exec.c" <<'PY'
+          import sys, pathlib
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          if '"/sbin/init"' in s:
+              print('pid1: /sbin/init already listed')
+              raise SystemExit
+          anchor = '\t"/sbin/launchd",\n};\n'
+          if anchor not in s:
+              raise SystemExit('pid1: init candidate list is not where it was; refusing to guess')
+          p.write_text(s.replace(anchor, '\t"/sbin/launchd",\n\t"/sbin/init",\n};\n', 1))
+          print('pid1: /sbin/init added')
+          PY
       - name: deps-xnu
         run: |
           export THEOS="$HOME/theos"
@@ -44,7 +71,7 @@ jobs:
           export KERNEL="$XNU_SRC/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837"
           ulimit -s unlimited
           set +e
-          ./xnu-build.sh -j4 > /tmp/build.log 2>&1
+          ./xnu-build.sh -k -j4 > /tmp/build.log 2>&1
           echo "xnu-build exit: $?"
           tail -60 /tmp/build.log
           KERNEL="$KERNEL" tools/make-kernel.sh --judge /tmp/build.log
